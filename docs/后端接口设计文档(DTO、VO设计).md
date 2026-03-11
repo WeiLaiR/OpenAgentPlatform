@@ -244,7 +244,7 @@ public class OperationResultVO {
 
 ## 4.6 发送消息（非流式）
 
-### `POST /api/v1/chat/send`
+### `POST /api/v1/chat/send-sync`
 
 这个接口主要用于：
 
@@ -296,9 +296,16 @@ public class ChatAnswerVO {
 
 ------
 
-## 4.7 发送消息（流式）
+## 4.7 发送消息（流式默认方案）
 
-### `POST /api/v1/chat/stream`
+默认采用“两步式”：
+
+1. `POST /api/v1/chat/send`
+2. `GET /api/v1/chat/stream/{requestId}`
+
+这样前端可以继续使用原生 `EventSource`，同时也能和 Trace 的 `GET /api/v1/traces/stream/{requestId}` 保持一致。
+
+### 第一步：`POST /api/v1/chat/send`
 
 ### Content-Type
 
@@ -309,39 +316,61 @@ application/json
 ### 返回
 
 ```
-text/event-stream
+ApiResponse<ChatRequestAcceptedVO>
 ```
 
-### 请求 DTO
+### 请求 DTO：`ChatSendRequest`
 
 仍使用 `ChatSendRequest`
+
+### 返回 VO：`ChatRequestAcceptedVO`
+
+```
+public class ChatRequestAcceptedVO {
+    private String requestId;
+    private Long conversationId;
+    private String status; // ACCEPTED / RUNNING
+    private Long acceptedAt;
+}
+```
+
+### 说明
+
+- `requestId` 是一次生成任务的唯一标识
+- 接口只负责创建请求，不直接返回 token 流
+- 若同一 `conversationId` 已有生成任务执行中，建议返回 `409 Conflict` 或明确的排队状态
+- 请求中的 `enableRag` / `enableAgent` / `knowledgeBaseIds` / `mcpServerIds` / `memoryEnabled` 为**本次请求覆盖项**
+- 覆盖优先级固定为：**请求参数 > 会话 settings > 系统默认**
+- 请求级覆盖只在当次生效，不自动回写会话配置
+
+### 第二步：`GET /api/v1/chat/stream/{requestId}`
+
+### 返回
+
+```
+text/event-stream
+```
 
 ### SSE 事件类型设计
 
 建议统一为：
 
 - `message_start`
-- `trace`
-- `rag`
-- `tool_call`
-- `tool_result`
 - `token`
 - `message_end`
 - `error`
 
-LangChain4j 的 `StreamingChatModel` 通过 `StreamingChatResponseHandler` 处理流式输出，非常适合映射到 SSE 事件流。
+说明：
+
+- 聊天流只承载回答生成相关事件
+- RAG / Tool / 内部执行过程放到独立 Trace SSE 通道
+- LangChain4j 的 `StreamingChatModel` 通过 `StreamingChatResponseHandler` 处理流式输出，非常适合映射到 SSE 事件流
 
 ### SSE 示例
 
 ```
 event: message_start
 data: {"requestId":"req_xxx","conversationId":1001}
-
-event: rag
-data: {"used":true,"snippets":[...]}
-
-event: tool_call
-data: {"toolName":"web_search","arguments":{"query":"langchain4j mcp"}}
 
 event: token
 data: {"content":"根据当前配置..."}
@@ -355,7 +384,6 @@ data: {"assistantMessageId":9002,"finishReason":"stop"}
 这个接口不直接返回完整 JSON，而是：
 
 - token 实时下发
-- trace 实时下发
 - 最终 answer 持久化后发送 `message_end`
 
 ------
@@ -849,7 +877,8 @@ public class McpToolVO {
     private Long id;
     private Long mcpServerId;
     private String serverName;
-    private String toolName;
+    private String toolName; // 运行时全局唯一名
+    private String originToolName; // 远端 MCP 原始工具名
     private String toolTitle;
     private String description;
     private Object inputSchemaJson;
@@ -919,6 +948,7 @@ public class TraceEventVO {
     private Long messageId;
     private String eventType;
     private String eventStage;
+    private String eventSource; // LANGCHAIN4J_NATIVE / APP_CUSTOM
     private Object eventPayloadJson;
     private Boolean successFlag;
     private Integer costMillis;
@@ -961,6 +991,12 @@ text/event-stream
 
 - 前端单独订阅 trace 时间线
 - 聊天区和 trace 区解耦
+- 内部事件与用户可见消息分离
+
+### 建议事件来源
+
+- LangChain4j 原生 observability / listener 事件优先直接映射
+- 平台特有事件再补 `APP_CUSTOM` 类型
 
 ------
 
@@ -992,6 +1028,14 @@ public class ConversationSettingsVO {
 
 LangChain4j 的 ChatMemory 常用实现是 `MessageWindowChatMemory` 与 `TokenWindowChatMemory`，所以这里保留 `memoryType`、`maxMessages`、`maxTokens` 是合理的。
 
+这里返回的是**会话持久配置**，不是某一次请求的实际生效配置。实际执行时仍按：
+
+- 请求参数覆盖项
+- 会话持久配置
+- 系统默认配置
+
+三层顺序解析。
+
 ------
 
 ## 8.2 更新会话配置
@@ -1012,6 +1056,10 @@ public class ConversationSettingsUpdateRequest {
     private List<Long> selectedMcpServerIds;
 }
 ```
+
+### 说明
+
+这个接口负责修改会话的持久配置。聊天发送接口里的同名字段只做单次覆盖，不回写这里。
 
 ------
 
@@ -1217,8 +1265,9 @@ void archiveConversation(Long conversationId);
 ### `ChatApplicationService`
 
 ```
-ChatAnswerVO send(ChatSendRequest request);
-void stream(ChatSendRequest request, SseEmitter emitter);
+ChatAnswerVO sendSync(ChatSendRequest request);
+ChatRequestAcceptedVO submit(ChatSendRequest request);
+void stream(String requestId, SseEmitter emitter);
 ChatAnswerVO regenerate(ChatRegenerateRequest request);
 PageResponse<ConversationMessageVO> pageMessages(Long conversationId, MessageQuery query);
 ```
@@ -1255,46 +1304,23 @@ void streamTrace(String requestId, SseEmitter emitter);
 
 ## 13. SSE 设计建议
 
-推荐两种模式二选一：
+本项目固定采用 **两步式 + 双 SSE 通道**，不再保留两套并行方案：
 
-### 模式 A：单 SSE 通道
+1. `POST /api/v1/chat/send`
+2. `GET /api/v1/chat/stream/{requestId}`
+3. `GET /api/v1/traces/stream/{requestId}`
 
-```
-/api/v1/chat/stream
-```
+原因：
 
-一个流里同时发送：
+- 浏览器原生 `EventSource` 更适合 `GET + URL` 的订阅方式
+- `requestId` 更适合表示“一次生成任务”，比 `conversationId` 更利于重试、重新生成、并发控制
+- 聊天区与 Trace 区天然解耦
+- Trace 可单独重放与补订阅
 
-- token
-- rag
-- tool_call
-- tool_result
-- trace
+补充说明：
 
-优点：
-
-- 简单
-- 前端接入快
-
-缺点：
-
-- 事件类型较多，前端解析逻辑稍复杂
-
-### 模式 B：双 SSE 通道
-
-- `/api/v1/chat/stream`
-- `/api/v1/traces/stream/{requestId}`
-
-优点：
-
-- 聊天区与 trace 区解耦
-- 可单独重放 trace
-
-缺点：
-
-- 前端维护两个 SSE 连接
-
-你的平台感更强，我建议最终用 **模式 B**。
+- 如果未来需要 `POST + text/event-stream`，前端应改为 `fetch` 流式读取或自定义 SSE 客户端
+- 第一版不建议同时维护两种流式协议，避免前后端分叉
 
 ------
 
@@ -1329,7 +1355,9 @@ void streamTrace(String requestId, SseEmitter emitter);
 
 - `POST /api/v1/conversations`
 - `GET /api/v1/conversations`
-- `POST /api/v1/chat/stream`
+- `POST /api/v1/chat/send`
+- `GET /api/v1/chat/stream/{requestId}`
+- `POST /api/v1/chat/send-sync`
 - `GET /api/v1/conversations/{conversationId}/messages`
 
 ### 知识库
