@@ -1,3 +1,29 @@
 spring:
   application:
     name: openagent
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.JdbcTemplateAutoConfiguration
+      - org.mybatis.spring.boot.autoconfigure.MybatisAutoConfiguration
+      - dev.langchain4j.openai.spring.AutoConfig
+server:
+  port: 8080
+
+openagent:
+  cors:
+    allowed-origins:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+  ai:
+    chat:
+      base-url: ${OPENAGENT_CHAT_BASE_URL:}
+      api-key: ${OPENAGENT_CHAT_API_KEY:}
+      model-name: ${OPENAGENT_CHAT_MODEL_NAME:}
+      temperature: ${OPENAGENT_CHAT_TEMPERATURE:0.2}
+      timeout: ${OPENAGENT_CHAT_TIMEOUT:PT2M}
+      log-requests: ${OPENAGENT_CHAT_LOG_REQUESTS:false}
+      log-responses: ${OPENAGENT_CHAT_LOG_RESPONSES:false}
+  chat:
+    session-retention: PT10M
