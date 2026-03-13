@@ -18,6 +18,13 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 @RestController
 @RequestMapping("/api/v1/chat")
 public class ChatController {
+    /**
+     * 这里刻意把“提交生成请求”和“订阅流式结果”拆成两个接口：
+     * 1. POST /send 负责创建任务并返回 requestId
+     * 2. GET /stream/{requestId} 负责通过 SSE 接收增量结果
+     *
+     * 这样更接近平台化聊天系统的实际形态，后续接入 RAG、MCP、Trace 时也更容易扩展。
+     */
 
     private final ChatGenerationService chatGenerationService;
     private final ChatStreamSessionStore chatStreamSessionStore;
@@ -32,6 +39,7 @@ public class ChatController {
 
     @PostMapping("/send-sync")
     public ApiResponse<ChatAnswerVO> sendSync(@Valid @RequestBody ChatSendRequest request) {
+        // 同步接口主要用于快速验证模型联通性，也便于和流式接口做效果对比。
         return ApiResponse.success(chatGenerationService.sendSync(request));
     }
 

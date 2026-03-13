@@ -1,15 +1,18 @@
 spring:
   application:
     name: openagent
+  config:
+    import: optional:classpath:application-local.yaml
   autoconfigure:
     exclude:
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration
-      - org.springframework.boot.autoconfigure.jdbc.JdbcTemplateAutoConfiguration
-      - org.mybatis.spring.boot.autoconfigure.MybatisAutoConfiguration
       - dev.langchain4j.openai.spring.AutoConfig
 server:
   port: 8080
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+    cache-enabled: false
 
 openagent:
   cors:

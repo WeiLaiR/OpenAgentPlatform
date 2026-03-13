@@ -13,12 +13,18 @@ import org.springframework.util.StringUtils;
 @Configuration
 @EnableConfigurationProperties(OpenAgentChatProperties.class)
 public class OpenAgentAiConfig {
+    /**
+     * 这一层只负责把 Spring 配置装配成 LangChain4j Bean。
+     * 当前没有使用 LangChain4j 官方 starter 自动生成 ChatModel，
+     * 而是手动创建 OpenAI 协议兼容模型，目的是让自定义配置项、后续扩展和学习路径都更清晰。
+     */
 
     @Bean
     @ConditionalOnExpression(
             "'${openagent.ai.chat.base-url:}' != '' and '${openagent.ai.chat.model-name:}' != ''"
     )
     public ChatModel chatModel(OpenAgentChatProperties properties) {
+        // ChatModel 对应“同步一次性返回完整答案”的调用方式。
         return OpenAiChatModel.builder()
                 .baseUrl(properties.getBaseUrl())
                 .apiKey(resolveApiKey(properties.getApiKey()))
@@ -35,6 +41,7 @@ public class OpenAgentAiConfig {
             "'${openagent.ai.chat.base-url:}' != '' and '${openagent.ai.chat.model-name:}' != ''"
     )
     public StreamingChatModel streamingChatModel(OpenAgentChatProperties properties) {
+        // StreamingChatModel 对应“边生成边回调 token”的调用方式，后端会把它再映射成 SSE。
         return OpenAiStreamingChatModel.builder()
                 .baseUrl(properties.getBaseUrl())
                 .apiKey(resolveApiKey(properties.getApiKey()))
@@ -47,6 +54,7 @@ public class OpenAgentAiConfig {
     }
 
     private String resolveApiKey(String apiKey) {
+        // 有些内网 OpenAI 兼容网关并不校验 api key，但 LangChain4j builder 仍要求提供非空值。
         return StringUtils.hasText(apiKey) ? apiKey : "demo";
     }
 }

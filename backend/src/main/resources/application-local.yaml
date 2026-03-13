@@ -1,0 +1,31 @@
+spring:
+  datasource:
+    url: jdbc:mysql://192.1.1.4:3306/openagent?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: Root@123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: OpenAgentHikariPool
+      minimum-idle: 2
+      maximum-pool-size: 10
+      connection-timeout: 30000
+      initialization-fail-timeout: -1
+
+milvus:
+  host: 192.1.1.4
+  port: 19530
+
+openagent:
+  ai:
+    chat:
+      base-url: http://192.1.1.4:8586/v1
+      api-key: demo
+      model-name: Qwen3.5-35B-A3B
+    embedding:
+      base-url: http://192.1.1.244:5000
+      api-key: demo
+      model-name: BAAI/bge-m3
+  storage:
+    type: LOCAL
+    local:
+      base-dir: D:\data\openagent\uploads

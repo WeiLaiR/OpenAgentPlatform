@@ -7,6 +7,12 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 public class ChatStreamSession {
+    /**
+     * 一次流式聊天请求在后端内存中的运行态对象。
+     * 它和数据库里的 conversation 不是一回事：
+     * conversation 是业务会话，
+     * 这里是某一次“流式生成任务”的临时执行上下文。
+     */
 
     private final String requestId;
     private final Long conversationId;
@@ -24,6 +30,7 @@ public class ChatStreamSession {
         this.createdAt = Instant.now().toEpochMilli();
         this.events = new CopyOnWriteArrayList<>();
         this.answerBuilder = new StringBuilder();
+        // ACCEPTED 表示请求已被接收，但模型生成线程还未正式开始执行。
         this.status = "ACCEPTED";
     }
 

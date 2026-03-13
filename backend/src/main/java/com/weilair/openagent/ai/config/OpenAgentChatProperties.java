@@ -6,6 +6,11 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties(prefix = "openagent.ai.chat")
 public class OpenAgentChatProperties {
+    /**
+     * 这里先只绑定“聊天模型”配置。
+     * 当前项目第一阶段先跑通 LangChain4j 的 Chat / Streaming 能力，
+     * Embedding、RAG、MCP 等能力后续会拆到各自的配置对象中。
+     */
 
     private String baseUrl;
     private String apiKey;
