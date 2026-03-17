@@ -2,7 +2,9 @@ package com.weilair.openagent.common.exception;
 
 import com.weilair.openagent.chat.exception.ChatRequestNotFoundException;
 import com.weilair.openagent.chat.exception.ChatServiceUnavailableException;
+import com.weilair.openagent.chat.exception.ConversationBusyException;
 import com.weilair.openagent.common.response.ApiError;
+import com.weilair.openagent.conversation.exception.ConversationNotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -38,6 +40,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleChatServiceUnavailable(ChatServiceUnavailableException exception) {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .body(ApiError.of(50300, "聊天模型不可用", exception.getMessage()));
+    }
+
+    @ExceptionHandler(ConversationNotFoundException.class)
+    public ResponseEntity<ApiError> handleConversationNotFound(ConversationNotFoundException exception) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiError.of(40401, "会话不存在", exception.getMessage()));
+    }
+
+    @ExceptionHandler(ConversationBusyException.class)
+    public ResponseEntity<ApiError> handleConversationBusy(ConversationBusyException exception) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiError.of(40900, "会话正在处理中", exception.getMessage()));
     }
 
     @ExceptionHandler(Exception.class)

@@ -105,6 +105,20 @@ public class ChatStreamSessionStore {
         return emitter;
     }
 
+    public SseEmitter connectTrace(String requestId) {
+        ChatStreamSession session = getRequired(requestId);
+        SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MILLIS);
+        session.traceEmitter(emitter);
+        emitter.onCompletion(() -> session.traceEmitter(null));
+        emitter.onTimeout(() -> session.traceEmitter(null));
+        emitter.onError(error -> session.traceEmitter(null));
+        replayBufferedTraceEvents(session, emitter);
+        if (session.isFinished()) {
+            emitter.complete();
+        }
+        return emitter;
+    }
+
     public void appendEvent(ChatStreamSession session, String eventName, Object payload) {
         // 先把事件名和负载封装成统一对象，便于缓冲、重放和发送。
         ChatStreamEvent event = new ChatStreamEvent(eventName, payload);
@@ -120,6 +134,26 @@ public class ChatStreamSessionStore {
         }
     }
 
+    public void appendTraceEvent(ChatStreamSession session, Object payload) {
+        ChatStreamEvent event = new ChatStreamEvent("trace", payload);
+        session.traceEvents().add(event);
+
+        SseEmitter emitter = session.traceEmitter();
+        if (emitter != null) {
+            send(emitter, event);
+        }
+    }
+
+    /**
+     * progress/thinking 这类提示只服务当前在线用户体验，不做事件缓冲，也不参与历史重放。
+     */
+    public void sendTransientEvent(ChatStreamSession session, String eventName, Object payload) {
+        SseEmitter emitter = session.emitter();
+        if (emitter != null) {
+            send(emitter, new ChatStreamEvent(eventName, payload));
+        }
+    }
+
     public void complete(ChatStreamSession session) {
         // 先把任务状态改成 COMPLETED，表示这次流式生成正常结束。
         session.status("COMPLETED");
@@ -131,6 +165,11 @@ public class ChatStreamSessionStore {
         SseEmitter emitter = session.emitter();
         if (emitter != null) {
             emitter.complete();
+        }
+
+        SseEmitter traceEmitter = session.traceEmitter();
+        if (traceEmitter != null) {
+            traceEmitter.complete();
         }
     }
 
@@ -149,11 +188,22 @@ public class ChatStreamSessionStore {
         if (emitter != null) {
             emitter.complete();
         }
+
+        SseEmitter traceEmitter = session.traceEmitter();
+        if (traceEmitter != null) {
+            traceEmitter.complete();
+        }
     }
 
     private void replayBufferedEvents(ChatStreamSession session, SseEmitter emitter) {
         // 顺序重放历史事件，保证前端后连上时看到的事件顺序和真实产生顺序一致。
         for (ChatStreamEvent event : session.events()) {
+            send(emitter, event);
+        }
+    }
+
+    private void replayBufferedTraceEvents(ChatStreamSession session, SseEmitter emitter) {
+        for (ChatStreamEvent event : session.traceEvents()) {
             send(emitter, event);
         }
     }

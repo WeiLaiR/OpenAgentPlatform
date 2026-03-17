@@ -18,17 +18,22 @@ public class ChatStreamSession {
     private final Long conversationId;
     private final long createdAt;
     private final List<ChatStreamEvent> events;
+    private final List<ChatStreamEvent> traceEvents;
     private final StringBuilder answerBuilder;
 
     private volatile SseEmitter emitter;
+    private volatile SseEmitter traceEmitter;
     private volatile String status;
     private volatile long finishedAt;
+    private volatile Long userMessageId;
+    private volatile boolean traceStreamingStarted;
 
     public ChatStreamSession(String requestId, Long conversationId) {
         this.requestId = requestId;
         this.conversationId = conversationId;
         this.createdAt = Instant.now().toEpochMilli();
         this.events = new CopyOnWriteArrayList<>();
+        this.traceEvents = new CopyOnWriteArrayList<>();
         this.answerBuilder = new StringBuilder();
         // ACCEPTED 表示请求已被接收，但模型生成线程还未正式开始执行。
         this.status = "ACCEPTED";
@@ -50,12 +55,24 @@ public class ChatStreamSession {
         return events;
     }
 
+    public List<ChatStreamEvent> traceEvents() {
+        return traceEvents;
+    }
+
     public SseEmitter emitter() {
         return emitter;
     }
 
     public void emitter(SseEmitter emitter) {
         this.emitter = emitter;
+    }
+
+    public SseEmitter traceEmitter() {
+        return traceEmitter;
+    }
+
+    public void traceEmitter(SseEmitter traceEmitter) {
+        this.traceEmitter = traceEmitter;
     }
 
     public String status() {
@@ -80,6 +97,26 @@ public class ChatStreamSession {
 
     public void finishedAt(long finishedAt) {
         this.finishedAt = finishedAt;
+    }
+
+    public Long userMessageId() {
+        return userMessageId;
+    }
+
+    public void userMessageId(Long userMessageId) {
+        this.userMessageId = userMessageId;
+    }
+
+    public boolean markTraceStreamingStarted() {
+        if (traceStreamingStarted) {
+            return false;
+        }
+        traceStreamingStarted = true;
+        return true;
+    }
+
+    public boolean isResponseStreamingStarted() {
+        return traceStreamingStarted;
     }
 
     public boolean isFinished() {

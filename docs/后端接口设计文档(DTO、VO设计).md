@@ -356,6 +356,7 @@ text/event-stream
 建议统一为：
 
 - `message_start`
+- `progress`
 - `token`
 - `message_end`
 - `error`
@@ -363,6 +364,7 @@ text/event-stream
 说明：
 
 - 聊天流只承载回答生成相关事件
+- `progress` 可用于推理模型首 token 前的“思考中”提示，但它是瞬时事件，不进入会话历史与数据库
 - RAG / Tool / 内部执行过程放到独立 Trace SSE 通道
 - LangChain4j 的 `StreamingChatModel` 通过 `StreamingChatResponseHandler` 处理流式输出，非常适合映射到 SSE 事件流
 
@@ -371,6 +373,9 @@ text/event-stream
 ```
 event: message_start
 data: {"requestId":"req_xxx","conversationId":1001}
+
+event: progress
+data: {"requestId":"req_xxx","status":"THINKING","message":"模型正在思考，请稍候…","elapsedMillis":1800}
 
 event: token
 data: {"content":"根据当前配置..."}
@@ -383,8 +388,16 @@ data: {"assistantMessageId":9002,"finishReason":"stop"}
 
 这个接口不直接返回完整 JSON，而是：
 
+- 首 token 前可按需发送瞬时 `progress` 提示
 - token 实时下发
 - 最终 answer 持久化后发送 `message_end`
+
+补充约定：
+
+- `progress/thinking` 事件只服务当前在线用户体验
+- 不写入 `conversation_message`
+- 不写入 `trace_event`
+- 不参与后续模型上下文
 
 ------
 

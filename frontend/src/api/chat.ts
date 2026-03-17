@@ -50,6 +50,13 @@ export interface StreamTokenEvent {
   content: string
 }
 
+export interface StreamProgressEvent {
+  requestId: string
+  status: string
+  message: string
+  elapsedMillis: number
+}
+
 export interface StreamCompletedEvent {
   requestId: string
   answer: string

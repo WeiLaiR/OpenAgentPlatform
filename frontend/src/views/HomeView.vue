@@ -1,16 +1,25 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
+import {
+  createConversation,
+  listConversationMessages,
+  listConversations,
+  type Conversation,
+  type ConversationMessage,
+} from '@/api/conversation'
 import {
   submitChat,
   sendChatSync,
   type ChatSendRequest,
   type StreamCompletedEvent,
   type StreamErrorEvent,
+  type StreamProgressEvent,
   type StreamTokenEvent,
 } from '@/api/chat'
-import { getSystemHealth, type SystemHealth } from '@/api/system'
 import { RequestError } from '@/api/http'
+import { getSystemHealth, type SystemHealth } from '@/api/system'
+import { getTraceDetail, type TraceEvent } from '@/api/trace'
 
 const health = ref<SystemHealth | null>(null)
 const loading = ref(false)
@@ -24,133 +33,20 @@ const modeState = ref({
   enableRag: false,
   enableAgent: false,
 })
-const messages = ref<Array<{ id: string; role: 'user' | 'assistant'; content: string; state?: string }>>([])
+const conversations = ref<Conversation[]>([])
+const messages = ref<ConversationMessage[]>([])
+const traces = ref<TraceEvent[]>([])
+const activeConversationId = ref<number | null>(null)
+const traceError = ref('')
+const thinkingRenderNow = ref(Date.now())
 
-const modeCards = [
-  {
-    title: 'LLM',
-    description: '先跑通最小问答闭环，确认前后端接口、requestId 和流式入口都成立。',
-  },
-  {
-    title: 'RAG',
-    description: '在聊天入口稳定后接入知识库索引、检索和上下文注入。',
-  },
-  {
-    title: 'Agent',
-    description: '把 MCP Server 与 Tool snapshot 纳入可配置能力，再交给模型调度。',
-  },
-  {
-    title: 'RAG + Agent',
-    description: '最后做统一编排，让检索和工具调用进入同一条主链路。',
-  },
-]
+let activeChatSource: EventSource | null = null
+let activeTraceSource: EventSource | null = null
+let thinkingTicker: number | null = null
 
-async function handleSendSync() {
-  const message = chatInput.value.trim()
-  if (!message || chatLoading.value) {
-    return
-  }
-
-  chatLoading.value = true
-  chatError.value = ''
-
-  try {
-    const answer = await sendChatSync(buildChatRequest(message))
-    messages.value.push(
-      { id: crypto.randomUUID(), role: 'user', content: message },
-      { id: crypto.randomUUID(), role: 'assistant', content: answer.answer, state: 'done' },
-    )
-    chatInput.value = ''
-  } catch (error) {
-    chatError.value = error instanceof RequestError ? error.message : '同步聊天调用失败。'
-  } finally {
-    chatLoading.value = false
-  }
-}
-
-async function handleSend() {
-  const message = chatInput.value.trim()
-  if (!message || chatLoading.value) {
-    return
-  }
-
-  chatLoading.value = true
-  chatError.value = ''
-
-  const userMessageId = crypto.randomUUID()
-  const assistantMessageId = crypto.randomUUID()
-
-  messages.value.push(
-    { id: userMessageId, role: 'user', content: message },
-    { id: assistantMessageId, role: 'assistant', content: '', state: 'streaming' },
-  )
-
-  try {
-    const accepted = await submitChat(buildChatRequest(message))
-    activeChatRequestId.value = accepted.requestId
-    chatInput.value = ''
-    await openStream(accepted.requestId, assistantMessageId)
-  } catch (error) {
-    removeMessageById(userMessageId)
-    removeMessageById(assistantMessageId)
-    chatLoading.value = false
-    chatError.value = error instanceof RequestError ? error.message : '聊天请求提交失败。'
-  }
-}
-
-function buildChatRequest(message: string): ChatSendRequest {
-  return {
-    message,
-    enableRag: modeState.value.enableRag,
-    enableAgent: modeState.value.enableAgent,
-  }
-}
-
-function openStream(streamRequestId: string, assistantMessageId: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const eventSource = new EventSource(`/api/v1/chat/stream/${streamRequestId}`)
-
-    eventSource.addEventListener('token', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as StreamTokenEvent
-      updateAssistantMessage(assistantMessageId, (current) => current + payload.content, 'streaming')
-    })
-
-    eventSource.addEventListener('message_end', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as StreamCompletedEvent
-      updateAssistantMessage(assistantMessageId, () => payload.answer, 'done')
-      activeChatRequestId.value = payload.requestId
-      chatLoading.value = false
-      eventSource.close()
-      resolve()
-    })
-
-    eventSource.addEventListener('error', (event) => {
-      if ((event as MessageEvent).data) {
-        const payload = JSON.parse((event as MessageEvent).data) as StreamErrorEvent
-        chatError.value = payload.message
-      } else {
-        chatError.value = '流式连接已中断。'
-      }
-      updateAssistantMessage(assistantMessageId, (current) => current || '请求失败。', 'error')
-      chatLoading.value = false
-      eventSource.close()
-      reject(new Error(chatError.value))
-    })
-  })
-}
-
-function removeMessageById(id: string) {
-  messages.value = messages.value.filter((item) => item.id !== id)
-}
-
-function updateAssistantMessage(id: string, updater: (current: string) => string, state: string) {
-  const target = messages.value.find((item) => item.id === id)
-  if (!target) {
-    return
-  }
-  target.content = updater(target.content)
-  target.state = state
-}
+const activeConversation = computed(() => {
+  return conversations.value.find((item) => item.id === activeConversationId.value) ?? null
+})
 
 const statusItems = computed(() => {
   if (!health.value) {
@@ -178,22 +74,6 @@ const lastCheckedAt = computed(() => {
   }).format(health.value.timestamp)
 })
 
-function resolveTagType(status: string): '' | 'success' | 'warning' | 'danger' | 'info' {
-  if (status === 'UP') {
-    return 'success'
-  }
-
-  if (status === 'DOWN') {
-    return 'danger'
-  }
-
-  if (status === 'NOT_CONFIGURED') {
-    return 'info'
-  }
-
-  return 'warning'
-}
-
 async function loadHealth() {
   loading.value = true
   errorMessage.value = ''
@@ -212,121 +92,447 @@ async function loadHealth() {
   }
 }
 
-onMounted(() => {
-  void loadHealth()
+async function loadConversations(preserveActive = true) {
+  const list = await listConversations()
+  conversations.value = list
+
+  if (preserveActive && activeConversationId.value) {
+    const exists = list.some((item) => item.id === activeConversationId.value)
+    if (exists) {
+      return
+    }
+  }
+
+  const firstConversation = list.length > 0 ? list[0]! : null
+  if (firstConversation) {
+    await selectConversation(firstConversation.id)
+    return
+  }
+
+  activeConversationId.value = null
+  messages.value = []
+}
+
+async function createNewConversation() {
+  const conversation = await createConversation({
+    title: '新会话',
+    enableRag: modeState.value.enableRag,
+    enableAgent: modeState.value.enableAgent,
+  })
+  conversations.value = [conversation, ...conversations.value]
+  await selectConversation(conversation.id)
+}
+
+async function selectConversation(conversationId: number) {
+  activeConversationId.value = conversationId
+  traces.value = []
+  traceError.value = ''
+  closeStreams()
+
+  const conversation = conversations.value.find((item) => item.id === conversationId)
+  if (conversation) {
+    modeState.value.enableRag = conversation.enableRag
+    modeState.value.enableAgent = conversation.enableAgent
+  }
+
+  messages.value = normalizeMessages(await listConversationMessages(conversationId))
+}
+
+async function handleSendSync() {
+  const message = chatInput.value.trim()
+  if (!message || chatLoading.value) {
+    return
+  }
+
+  chatLoading.value = true
+  chatError.value = ''
+  traceError.value = ''
+
+  try {
+    const answer = await sendChatSync(buildChatRequest(message))
+    activeChatRequestId.value = answer.requestId ?? ''
+    chatInput.value = ''
+    await refreshAfterRound(answer.conversationId, answer.requestId ?? null)
+  } catch (error) {
+    chatError.value = error instanceof RequestError ? error.message : '同步聊天调用失败。'
+  } finally {
+    chatLoading.value = false
+  }
+}
+
+async function handleSend() {
+  const message = chatInput.value.trim()
+  if (!message || chatLoading.value) {
+    return
+  }
+
+  chatLoading.value = true
+  chatError.value = ''
+  traceError.value = ''
+  traces.value = []
+  closeStreams()
+
+  const optimisticUserMessageId = -Date.now()
+  const optimisticAssistantMessageId = -(Date.now() + 1)
+  const currentConversationId = activeConversationId.value ?? 0
+
+  messages.value = [
+    ...messages.value,
+    {
+      id: optimisticUserMessageId,
+      conversationId: currentConversationId,
+      roleCode: 'USER',
+      messageType: 'TEXT',
+      content: message,
+      requestId: null,
+      finishReason: null,
+      createdAt: Date.now(),
+    },
+    {
+      id: optimisticAssistantMessageId,
+      conversationId: currentConversationId,
+      roleCode: 'ASSISTANT',
+      messageType: 'TEXT',
+      content: '',
+      requestId: null,
+      finishReason: null,
+      createdAt: Date.now(),
+      uiState: 'thinking',
+      thinkingStartedAt: Date.now(),
+      progressMessage: '模型正在思考，请稍候…',
+    },
+  ]
+
+  try {
+    const accepted = await submitChat(buildChatRequest(message))
+    activeChatRequestId.value = accepted.requestId
+    if (accepted.conversationId) {
+      activeConversationId.value = accepted.conversationId
+    }
+    chatInput.value = ''
+    bindOptimisticMessages(optimisticUserMessageId, optimisticAssistantMessageId, accepted)
+    const chatStreamPromise = openChatStream(accepted.requestId, optimisticAssistantMessageId)
+    window.setTimeout(() => {
+      openTraceStream(accepted.requestId)
+    }, 0)
+    await chatStreamPromise
+    await refreshAfterRound(accepted.conversationId, accepted.requestId)
+  } catch (error) {
+    removeOptimisticMessages([optimisticUserMessageId, optimisticAssistantMessageId])
+    chatError.value = error instanceof RequestError ? error.message : '聊天请求提交失败。'
+  } finally {
+    chatLoading.value = false
+  }
+}
+
+function buildChatRequest(message: string): ChatSendRequest {
+  return {
+    conversationId: activeConversationId.value ?? undefined,
+    message,
+    enableRag: modeState.value.enableRag,
+    enableAgent: modeState.value.enableAgent,
+  }
+}
+
+function openChatStream(streamRequestId: string, assistantMessageId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    activeChatSource = new EventSource(`/api/v1/chat/stream/${streamRequestId}`)
+
+    activeChatSource.addEventListener('progress', (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as StreamProgressEvent
+      updateAssistantProgress(assistantMessageId, streamRequestId, payload)
+    })
+
+    activeChatSource.addEventListener('token', (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as StreamTokenEvent
+      appendAssistantChunk(assistantMessageId, streamRequestId, payload.content)
+    })
+
+    activeChatSource.addEventListener('message_end', (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as StreamCompletedEvent
+      completeAssistantMessage(assistantMessageId, streamRequestId, payload.answer)
+      activeChatSource?.close()
+      activeChatSource = null
+      resolve()
+    })
+
+    activeChatSource.addEventListener('error', (event) => {
+      if ((event as MessageEvent).data) {
+        const payload = JSON.parse((event as MessageEvent).data) as StreamErrorEvent
+        chatError.value = payload.message
+      } else {
+        chatError.value = '流式连接已中断。'
+      }
+      markAssistantMessageError(assistantMessageId, streamRequestId)
+      activeChatSource?.close()
+      activeChatSource = null
+      reject(new Error(chatError.value))
+    })
+  })
+}
+
+function openTraceStream(streamRequestId: string) {
+  activeTraceSource = new EventSource(`/api/v1/traces/stream/${streamRequestId}`)
+
+  activeTraceSource.addEventListener('trace', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as TraceEvent
+    traces.value = [...traces.value, payload]
+  })
+
+  activeTraceSource.addEventListener('error', () => {
+    activeTraceSource?.close()
+    activeTraceSource = null
+  })
+}
+
+function bindOptimisticMessages(
+  userMessageId: number,
+  assistantMessageId: number,
+  accepted: { requestId: string; conversationId: number | null },
+) {
+  const conversationId = accepted.conversationId ?? activeConversationId.value ?? 0
+  const userMessage = messages.value.find((item) => item.id === userMessageId)
+  const assistantMessage = messages.value.find((item) => item.id === assistantMessageId)
+
+  if (userMessage) {
+    userMessage.requestId = accepted.requestId
+    userMessage.conversationId = conversationId
+  }
+
+  if (assistantMessage) {
+    assistantMessage.requestId = accepted.requestId
+    assistantMessage.conversationId = conversationId
+  }
+}
+
+function appendAssistantChunk(assistantMessageId: number, streamRequestId: string, content: string) {
+  const existing = messages.value.find((item) => item.id === assistantMessageId)
+  if (existing) {
+    existing.requestId = streamRequestId
+    existing.content = `${existing.content ?? ''}${content}`
+    existing.uiState = 'streaming'
+    return
+  }
+
+  messages.value = [
+    ...messages.value,
+    {
+      id: -Date.now(),
+      conversationId: activeConversationId.value ?? 0,
+      roleCode: 'ASSISTANT',
+      messageType: 'TEXT',
+      content,
+      requestId: streamRequestId,
+      finishReason: null,
+      createdAt: Date.now(),
+      uiState: 'streaming',
+    },
+  ]
+}
+
+function completeAssistantMessage(assistantMessageId: number, streamRequestId: string, answer: string) {
+  const target = messages.value.find((item) => item.id === assistantMessageId)
+  if (target) {
+    target.requestId = streamRequestId
+    target.content = answer
+    target.finishReason = 'stop'
+    target.uiState = 'done'
+  }
+}
+
+function markAssistantMessageError(assistantMessageId: number, streamRequestId: string) {
+  const target = messages.value.find((item) => item.id === assistantMessageId)
+  if (target && !target.content) {
+    target.requestId = streamRequestId
+    target.content = '请求失败。'
+    target.uiState = 'error'
+  }
+}
+
+function updateAssistantProgress(
+  assistantMessageId: number,
+  streamRequestId: string,
+  payload: StreamProgressEvent,
+) {
+  const target = messages.value.find((item) => item.id === assistantMessageId)
+  if (!target) {
+    return
+  }
+  target.requestId = streamRequestId
+  target.uiState = 'thinking'
+  target.progressMessage = payload.message
+  if (!target.thinkingStartedAt) {
+    target.thinkingStartedAt = Date.now() - payload.elapsedMillis
+  }
+}
+
+function removeOptimisticMessages(messageIds: number[]) {
+  messages.value = messages.value.filter((item) => !messageIds.includes(item.id))
+}
+
+function closeStreams() {
+  activeChatSource?.close()
+  activeTraceSource?.close()
+  activeChatSource = null
+  activeTraceSource = null
+}
+
+async function refreshAfterRound(conversationId: number | null, chatRequestId: string | null) {
+  await loadConversations()
+
+  if (conversationId) {
+    await selectConversation(conversationId)
+  }
+
+  if (chatRequestId) {
+    const detail = await getTraceDetail(chatRequestId)
+    traces.value = detail.events
+  }
+}
+
+function resolveTagType(status: string): '' | 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'UP') {
+    return 'success'
+  }
+
+  if (status === 'DOWN') {
+    return 'danger'
+  }
+
+  if (status === 'NOT_CONFIGURED') {
+    return 'info'
+  }
+
+  return 'warning'
+}
+
+function formatTime(timestamp: number | null | undefined) {
+  if (!timestamp) {
+    return '未开始'
+  }
+  return new Intl.DateTimeFormat('zh-CN', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(timestamp)
+}
+
+function formatThinkingElapsed(startedAt: number | undefined) {
+  if (!startedAt) {
+    return '0s'
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((thinkingRenderNow.value - startedAt) / 1000))
+  return `${elapsedSeconds}s`
+}
+
+function normalizeMessages(records: ConversationMessage[]) {
+  return records.map((item) => ({
+    ...item,
+    uiState: item.roleCode === 'ASSISTANT' ? ('done' as const) : undefined,
+  }))
+}
+
+function formatTracePayload(payload: string) {
+  try {
+    return JSON.stringify(JSON.parse(payload), null, 2)
+  } catch {
+    return payload
+  }
+}
+
+onMounted(async () => {
+  thinkingTicker = window.setInterval(() => {
+    thinkingRenderNow.value = Date.now()
+  }, 1000)
+  await Promise.all([loadHealth(), loadConversations(false)])
+})
+
+onBeforeUnmount(() => {
+  if (thinkingTicker !== null) {
+    window.clearInterval(thinkingTicker)
+  }
+  closeStreams()
 })
 </script>
 
 <template>
-  <section class="hero-grid">
-    <el-card class="hero-card hero-card--intro" shadow="never">
+  <section class="top-grid">
+    <el-card class="summary-card" shadow="never">
       <template #header>
         <div class="section-head">
           <div>
-            <p class="section-kicker">阶段一骨架</p>
-            <h2>项目已经可以正式进入开发</h2>
+            <p class="section-kicker">阶段三</p>
+            <h2>会话、消息、Trace 已进入主链路</h2>
           </div>
-          <el-tag type="warning">当前起步面：基础工程 + 健康检查</el-tag>
+          <el-button :loading="loading" type="primary" @click="loadHealth">刷新健康检查</el-button>
         </div>
       </template>
 
       <p class="lead">
-        `docs/` 已经把技术基线、模式编排、接口形态和阶段顺序定义清楚了。现在缺的不是继续写方案，而是开始把第一阶段骨架做成可验证的代码闭环。
+        当前页面不再只是聊天联调面板，而是最小平台形态：左侧会话列表，中间聊天，右侧请求级
+        Trace。下一步就可以在这个骨架上继续接 RAG 和 Agent。
       </p>
 
-      <div class="mode-grid">
-        <article v-for="mode in modeCards" :key="mode.title" class="mode-item">
-          <h3>{{ mode.title }}</h3>
-          <p>{{ mode.description }}</p>
-        </article>
+      <div v-if="errorMessage" class="alert-wrap">
+        <el-alert :closable="false" show-icon title="健康检查失败" type="error">
+          <template #default>{{ errorMessage }}</template>
+        </el-alert>
+      </div>
+
+      <div v-else-if="health" class="status-grid">
+        <div v-for="item in statusItems" :key="item.label" class="status-item">
+          <span class="status-label">{{ item.label }}</span>
+          <el-tag :type="resolveTagType(item.value)">{{ item.value }}</el-tag>
+        </div>
+      </div>
+
+      <div class="meta-row">
+        <span>最近检查：{{ lastCheckedAt }}</span>
+        <span>HTTP requestId：{{ requestId || '未生成' }}</span>
+        <span>聊天 requestId：{{ activeChatRequestId || '未发送' }}</span>
       </div>
     </el-card>
+  </section>
 
-    <el-card class="hero-card hero-card--health" shadow="never">
+  <section class="workspace-grid">
+    <el-card class="panel conversations-panel" shadow="never">
       <template #header>
         <div class="section-head">
           <div>
-            <p class="section-kicker">后端连通性</p>
-            <h2>系统健康检查</h2>
+            <p class="section-kicker">会话</p>
+            <h2>Conversation</h2>
           </div>
-          <el-button :loading="loading" type="primary" @click="loadHealth">重新检查</el-button>
+          <el-button type="primary" @click="createNewConversation">新建会话</el-button>
         </div>
       </template>
 
-      <el-alert
-        v-if="errorMessage"
-        :closable="false"
-        show-icon
-        title="健康检查调用失败"
-        type="error"
+      <div v-if="conversations.length === 0" class="empty-state">
+        还没有会话。可以先新建一个，或者直接发送第一条消息让后端自动创建。
+      </div>
+
+      <button
+        v-for="conversation in conversations"
+        :key="conversation.id"
+        class="conversation-item"
+        :class="{ 'conversation-item--active': conversation.id === activeConversationId }"
+        type="button"
+        @click="selectConversation(conversation.id)"
       >
-        <template #default>{{ errorMessage }}</template>
-      </el-alert>
-
-      <template v-else-if="health">
-        <div class="meta-row">
-          <span>最近检查时间：{{ lastCheckedAt }}</span>
-          <span>requestId：{{ requestId }}</span>
-        </div>
-
-        <div class="status-grid">
-          <div v-for="item in statusItems" :key="item.label" class="status-item">
-            <span class="status-label">{{ item.label }}</span>
-            <el-tag :type="resolveTagType(item.value)">{{ item.value }}</el-tag>
-          </div>
-        </div>
-      </template>
-
-      <el-skeleton v-else :rows="6" animated />
+        <strong>{{ conversation.title }}</strong>
+        <span>{{ conversation.modeCode }}</span>
+        <span>{{ formatTime(conversation.lastMessageAt ?? conversation.updatedAt) }}</span>
+      </button>
     </el-card>
-  </section>
 
-  <section class="next-grid">
-    <el-card shadow="never">
+    <el-card class="panel chat-panel" shadow="never">
       <template #header>
         <div class="section-head">
           <div>
-            <p class="section-kicker">当前已落地</p>
-            <h2>第一批基础能力</h2>
+            <p class="section-kicker">聊天</p>
+            <h2>{{ activeConversation?.title ?? '未选择会话' }}</h2>
           </div>
-        </div>
-      </template>
-
-      <ul class="plain-list">
-        <li>后端统一返回结构 `ApiResponse` 与错误结构 `ApiError`。</li>
-        <li>后端请求级 `requestId` 生成与透传，便于后续 SSE 与 Trace 对齐。</li>
-        <li>系统健康检查接口 `/api/v1/system/health` 可直接被前端调用。</li>
-        <li>前端基础控制台、路由和请求封装已具备继续扩展的落点。</li>
-      </ul>
-    </el-card>
-
-    <el-card shadow="never">
-      <template #header>
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">下一步建议</p>
-            <h2>按文档顺序继续推进</h2>
-          </div>
-        </div>
-      </template>
-
-      <ol class="plain-list">
-        <li>接入 LangChain4j `ChatModel` 与 `StreamingChatModel`，开始做最小聊天闭环。</li>
-        <li>补 `conversation` 和 `conversation_message`，让聊天从一次性请求变成有状态会话。</li>
-        <li>再引入 SSE 双通道，为后续 RAG、Agent 和 Trace 留稳定入口。</li>
-      </ol>
-    </el-card>
-  </section>
-
-  <section class="chat-section">
-    <el-card shadow="never" class="chat-card">
-      <template #header>
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">阶段二起点</p>
-            <h2>最小聊天闭环</h2>
-          </div>
-          <span class="meta-inline">当前 requestId：{{ activeChatRequestId || '尚未发送' }}</span>
+          <span class="meta-inline">
+            {{ activeConversation ? `会话 #${activeConversation.id}` : '可直接发送首条消息自动创建' }}
+          </span>
         </div>
       </template>
 
@@ -335,33 +541,33 @@ onMounted(() => {
         <el-switch v-model="modeState.enableAgent" active-text="Agent" />
       </div>
 
-      <el-alert
-        v-if="chatError"
-        :closable="false"
-        show-icon
-        title="聊天请求失败"
-        type="error"
-      >
+      <el-alert v-if="chatError" :closable="false" show-icon title="聊天请求失败" type="error">
         <template #default>{{ chatError }}</template>
       </el-alert>
 
       <div class="chat-history">
-        <div v-if="messages.length === 0" class="chat-empty">
-          现在已经能直接调用后端聊天接口。先配置 `OPENAGENT_CHAT_BASE_URL`、`OPENAGENT_CHAT_API_KEY`、
-          `OPENAGENT_CHAT_MODEL_NAME`，再从这里开始联调。
+        <div v-if="messages.length === 0" class="empty-state">
+          当前会话还没有消息。输入一条内容后，后端会把 user / assistant 消息持久化到
+          `conversation_message`。
         </div>
 
         <article
           v-for="message in messages"
-          :key="message.id"
+          :key="`${message.id}-${message.createdAt}`"
           class="message-item"
-          :class="`message-item--${message.role}`"
+          :class="`message-item--${message.roleCode.toLowerCase()}`"
         >
           <div class="message-meta">
-            <strong>{{ message.role === 'user' ? 'User' : 'Assistant' }}</strong>
-            <span v-if="message.state">{{ message.state }}</span>
+            <strong>{{ message.roleCode }}</strong>
+            <span>{{ formatTime(message.createdAt) }}</span>
           </div>
-          <p>{{ message.content || '...' }}</p>
+          <p v-if="message.content">{{ message.content }}</p>
+          <div v-else-if="message.roleCode === 'ASSISTANT' && message.uiState === 'thinking'" class="thinking-block">
+            <span class="thinking-dot"></span>
+            <span>{{ message.progressMessage || '模型正在思考，请稍候…' }}</span>
+            <span class="thinking-elapsed">{{ formatThinkingElapsed(message.thinkingStartedAt) }}</span>
+          </div>
+          <p v-else>...</p>
         </article>
       </div>
 
@@ -371,7 +577,7 @@ onMounted(() => {
           :autosize="{ minRows: 4, maxRows: 8 }"
           :disabled="chatLoading"
           maxlength="20000"
-          placeholder="输入一条消息，验证 LangChain4j ChatModel 和 StreamingChatModel 接入。"
+          placeholder="输入一条消息，验证会话持久化、流式输出和 Trace 双通道。"
           resize="none"
           show-word-limit
           type="textarea"
@@ -383,42 +589,87 @@ onMounted(() => {
         </div>
       </div>
     </el-card>
+
+    <el-card class="panel trace-panel" shadow="never">
+      <template #header>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Trace</p>
+            <h2>Request Timeline</h2>
+          </div>
+        </div>
+      </template>
+
+      <el-alert v-if="traceError" :closable="false" show-icon title="Trace 订阅失败" type="error">
+        <template #default>{{ traceError }}</template>
+      </el-alert>
+
+      <div v-if="traces.length === 0" class="empty-state">
+        当前还没有 trace 事件。发送消息后，这里会展示 `USER_MESSAGE_RECEIVED`、
+        `MODEL_REQUEST_STARTED`、`FINAL_RESPONSE_COMPLETED` 等过程事件。
+      </div>
+
+      <article v-for="trace in traces" :key="trace.id" class="trace-item">
+        <div class="trace-head">
+          <strong>{{ trace.eventType }}</strong>
+          <span>{{ formatTime(trace.createdAt) }}</span>
+        </div>
+        <div class="trace-meta">
+          <span>{{ trace.eventStage || 'NO_STAGE' }}</span>
+          <span>{{ trace.eventSource }}</span>
+          <span>{{ trace.successFlag ? 'SUCCESS' : 'FAILED' }}</span>
+        </div>
+        <pre>{{ formatTracePayload(trace.eventPayloadJson) }}</pre>
+      </article>
+    </el-card>
   </section>
 </template>
 
 <style scoped>
-.hero-grid,
-.next-grid,
-.chat-section {
+.top-grid,
+.workspace-grid {
   display: grid;
   gap: 20px;
 }
 
-.hero-grid {
-  grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.9fr);
-  margin-bottom: 20px;
-}
-
-.next-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.hero-card {
+.summary-card,
+.panel {
   border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.86);
   backdrop-filter: blur(12px);
 }
 
-.hero-card--intro {
+.summary-card {
   background:
-    linear-gradient(135deg, rgba(255, 248, 230, 0.95), rgba(255, 255, 255, 0.78)),
-    rgba(255, 255, 255, 0.8);
+    linear-gradient(135deg, rgba(255, 246, 230, 0.95), rgba(255, 255, 255, 0.82)),
+    rgba(255, 255, 255, 0.86);
 }
 
-.hero-card--health {
+.workspace-grid {
+  grid-template-columns: minmax(240px, 0.85fr) minmax(0, 1.4fr) minmax(320px, 1fr);
+  align-items: start;
+}
+
+.panel {
+  min-height: 640px;
+}
+
+.conversations-panel {
   background:
-    linear-gradient(180deg, rgba(236, 245, 255, 0.92), rgba(255, 255, 255, 0.8)),
-    rgba(255, 255, 255, 0.8);
+    linear-gradient(180deg, rgba(246, 249, 252, 0.96), rgba(255, 255, 255, 0.88)),
+    rgba(255, 255, 255, 0.86);
+}
+
+.chat-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 252, 244, 0.96), rgba(255, 255, 255, 0.9)),
+    rgba(255, 255, 255, 0.86);
+}
+
+.trace-panel {
+  background:
+    linear-gradient(180deg, rgba(241, 247, 255, 0.96), rgba(255, 255, 255, 0.9)),
+    rgba(255, 255, 255, 0.86);
 }
 
 .section-head {
@@ -438,78 +689,90 @@ onMounted(() => {
   font-size: 12px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: #7c5b27;
+  color: #8b5e21;
 }
 
 .lead {
   margin: 0 0 20px;
-  font-size: 16px;
   line-height: 1.75;
-  color: #3d4d63;
+  color: #425466;
 }
 
-.mode-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-}
-
-.mode-item {
-  padding: 18px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.72);
-}
-
-.mode-item h3,
-.status-label {
-  margin: 0 0 8px;
-}
-
-.mode-item p {
-  margin: 0;
-  line-height: 1.7;
-  color: #4b5563;
-}
-
-.meta-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px 20px;
-  margin-bottom: 18px;
-  color: #4b5563;
+.alert-wrap {
+  margin-bottom: 16px;
 }
 
 .status-grid {
   display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+  margin-bottom: 16px;
 }
 
 .status-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  display: grid;
+  gap: 8px;
   padding: 14px 16px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.74);
 }
 
-.plain-list {
-  margin: 0;
-  padding-left: 20px;
-  color: #374151;
-  line-height: 1.9;
+.status-label {
+  color: #475569;
 }
 
-.chat-card {
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.82);
-  backdrop-filter: blur(12px);
+.meta-row,
+.trace-meta,
+.message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  color: #64748b;
+  font-size: 13px;
 }
 
 .meta-inline {
-  color: #6b7280;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.conversations-panel,
+.trace-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.conversation-item {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.9);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease;
+}
+
+.conversation-item:hover,
+.conversation-item--active {
+  transform: translateY(-1px);
+  border-color: rgba(31, 78, 121, 0.45);
+  background:
+    linear-gradient(135deg, rgba(255, 248, 230, 0.9), rgba(255, 255, 255, 0.96)),
+    rgba(248, 250, 252, 0.9);
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
+}
+
+.conversation-item strong {
+  color: #0f172a;
+}
+
+.conversation-item span {
+  color: #64748b;
   font-size: 13px;
 }
 
@@ -526,16 +789,11 @@ onMounted(() => {
 .chat-history {
   display: grid;
   gap: 14px;
-  min-height: 220px;
+  min-height: 400px;
   padding: 18px;
   margin: 16px 0;
   border-radius: 20px;
-  background: linear-gradient(180deg, rgba(248, 250, 252, 0.9), rgba(241, 245, 249, 0.7));
-}
-
-.chat-empty {
-  color: #64748b;
-  line-height: 1.8;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.94), rgba(241, 245, 249, 0.72));
 }
 
 .message-item {
@@ -556,19 +814,33 @@ onMounted(() => {
   border: 1px solid rgba(15, 23, 42, 0.08);
 }
 
-.message-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 8px;
-  font-size: 12px;
-  opacity: 0.75;
-}
-
 .message-item p {
-  margin: 0;
+  margin: 8px 0 0;
   white-space: pre-wrap;
   line-height: 1.75;
+}
+
+.thinking-block {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.thinking-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #c58a1d;
+  box-shadow: 0 0 0 rgba(197, 138, 29, 0.45);
+  animation: pulse 1.4s infinite;
+}
+
+.thinking-elapsed {
+  font-size: 12px;
+  color: #64748b;
 }
 
 .chat-editor {
@@ -576,18 +848,75 @@ onMounted(() => {
   gap: 12px;
 }
 
-@media (max-width: 960px) {
-  .hero-grid,
-  .next-grid,
-  .mode-grid {
+.trace-item {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(241, 245, 249, 0.86)),
+    rgba(248, 250, 252, 0.9);
+}
+
+.trace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trace-item pre {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border-radius: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.empty-state {
+  color: #64748b;
+  line-height: 1.8;
+}
+
+@media (max-width: 1200px) {
+  .workspace-grid {
     grid-template-columns: 1fr;
   }
 
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
   .section-head,
-  .status-item,
-  .chat-actions {
+  .chat-actions,
+  .trace-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@keyframes pulse {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(197, 138, 29, 0.4);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 10px rgba(197, 138, 29, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(197, 138, 29, 0);
   }
 }
 </style>
