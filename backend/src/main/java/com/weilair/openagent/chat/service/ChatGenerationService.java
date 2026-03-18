@@ -1,5 +1,6 @@
 package com.weilair.openagent.chat.service;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -16,6 +17,7 @@ import com.weilair.openagent.chat.model.ChatStreamSession;
 import com.weilair.openagent.common.request.RequestIdContext;
 import com.weilair.openagent.conversation.model.ConversationDO;
 import com.weilair.openagent.conversation.service.ConversationService;
+import com.weilair.openagent.knowledge.service.KnowledgeRetrievalService;
 import com.weilair.openagent.trace.service.TraceService;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
@@ -24,6 +26,7 @@ import com.weilair.openagent.web.vo.ChatStreamCompletedVO;
 import com.weilair.openagent.web.vo.ChatStreamProgressVO;
 import com.weilair.openagent.web.vo.ChatStreamStartedVO;
 import com.weilair.openagent.web.vo.ChatStreamTokenVO;
+import com.weilair.openagent.web.vo.RagSnippetVO;
 import com.weilair.openagent.web.vo.TraceEventVO;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
@@ -41,11 +44,15 @@ public class ChatGenerationService {
      * 但已经把后续这些能力所依赖的 conversationId / requestId / trace 骨架先搭好了。
      */
 
+    private static final int RAG_TOP_K = 4;
+    private static final double RAG_MIN_SCORE = 0.55d;
+
     private final ObjectProvider<ChatModel> chatModelProvider;
     private final ObjectProvider<StreamingChatModel> streamingChatModelProvider;
     private final ChatStreamSessionStore sessionStore;
     private final ChatContextAssembler chatContextAssembler;
     private final ConversationService conversationService;
+    private final KnowledgeRetrievalService knowledgeRetrievalService;
     private final TraceService traceService;
     private final ConversationExecutionGuard executionGuard;
     private final ExecutorService executorService;
@@ -56,6 +63,7 @@ public class ChatGenerationService {
             ChatStreamSessionStore sessionStore,
             ChatContextAssembler chatContextAssembler,
             ConversationService conversationService,
+            KnowledgeRetrievalService knowledgeRetrievalService,
             TraceService traceService,
             ConversationExecutionGuard executionGuard
     ) {
@@ -64,6 +72,7 @@ public class ChatGenerationService {
         this.sessionStore = sessionStore;
         this.chatContextAssembler = chatContextAssembler;
         this.conversationService = conversationService;
+        this.knowledgeRetrievalService = knowledgeRetrievalService;
         this.traceService = traceService;
         this.executionGuard = executionGuard;
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
@@ -81,8 +90,9 @@ public class ChatGenerationService {
 
         try {
             long startedAt = System.currentTimeMillis();
-            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message());
             Long userMessageId = conversationService.saveUserMessage(conversation.getId(), requestId, request.message());
+            List<RagSnippetVO> ragSnippets = retrieveRagSnippets(conversation, request, requestId, userMessageId, null);
+            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
             appendTrace(
                     conversation.getId(),
                     requestId,
@@ -100,7 +110,7 @@ public class ChatGenerationService {
                     userMessageId,
                     "MODEL_REQUEST_STARTED",
                     "MODEL",
-                    tracePayload("mode", "SYNC"),
+                    modelStartPayload("SYNC", ragSnippets.size()),
                     true,
                     null,
                     null
@@ -133,8 +143,8 @@ public class ChatGenerationService {
                     conversation.getId(),
                     answer,
                     "stop",
-                    Boolean.TRUE.equals(request.enableRag()),
-                    Boolean.TRUE.equals(request.enableAgent()),
+                    !ragSnippets.isEmpty(),
+                    isAgentEnabled(conversation, request),
                     elapsedMillis
             );
         } finally {
@@ -153,9 +163,16 @@ public class ChatGenerationService {
         executionGuard.acquire(conversation.getId(), session.requestId());
 
         try {
-            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message());
             Long userMessageId = conversationService.saveUserMessage(conversation.getId(), session.requestId(), request.message());
             session.userMessageId(userMessageId);
+            List<RagSnippetVO> ragSnippets = retrieveRagSnippets(
+                    conversation,
+                    request,
+                    session.requestId(),
+                    userMessageId,
+                    session
+            );
+            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
 
             sessionStore.appendEvent(
                     session,
@@ -173,7 +190,7 @@ public class ChatGenerationService {
             );
 
             executorService.submit(() -> emitThinkingProgress(session));
-            executorService.submit(() -> streamAnswer(streamingChatModel, session, contextMessages));
+            executorService.submit(() -> streamAnswer(streamingChatModel, session, contextMessages, ragSnippets.size()));
 
             return new ChatRequestAcceptedVO(
                     session.requestId(),
@@ -196,7 +213,12 @@ public class ChatGenerationService {
      * 这里把流式 token、assistant 消息落库和 trace 事件写入放到同一条执行线上，
      * 这样前端时间线和数据库里的请求级轨迹不会漂移。
      */
-    private void streamAnswer(StreamingChatModel streamingChatModel, ChatStreamSession session, List<ChatMessage> messages) {
+    private void streamAnswer(
+            StreamingChatModel streamingChatModel,
+            ChatStreamSession session,
+            List<ChatMessage> messages,
+            int ragSnippetCount
+    ) {
         session.status("RUNNING");
         long startedAt = System.currentTimeMillis();
         appendTrace(
@@ -204,7 +226,7 @@ public class ChatGenerationService {
                 "MODEL_REQUEST_STARTED",
                 "MODEL",
                 session.userMessageId(),
-                tracePayload("mode", "STREAM"),
+                modelStartPayload("STREAM", ragSnippetCount),
                 true,
                 null
         );
@@ -402,6 +424,88 @@ public class ChatGenerationService {
 
     private Map<String, Object> tracePayload(String key, Object value) {
         return Map.of(key, value == null ? "" : value);
+    }
+
+    private Map<String, Object> modelStartPayload(String mode, int ragSnippetCount) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("mode", mode);
+        payload.put("ragSnippetCount", ragSnippetCount);
+        return payload;
+    }
+
+    private List<RagSnippetVO> retrieveRagSnippets(
+            ConversationDO conversation,
+            ChatSendRequest request,
+            String requestId,
+            Long userMessageId,
+            ChatStreamSession session
+    ) {
+        if (!isRagEnabled(conversation, request) || request.knowledgeBaseIds() == null || request.knowledgeBaseIds().isEmpty()) {
+            return List.of();
+        }
+
+        long startedAt = System.currentTimeMillis();
+        Map<String, Object> startPayload = new LinkedHashMap<>();
+        startPayload.put("knowledgeBaseIds", request.knowledgeBaseIds());
+        startPayload.put("topK", RAG_TOP_K);
+        startPayload.put("minScore", RAG_MIN_SCORE);
+        appendTrace(
+                conversation.getId(),
+                requestId,
+                userMessageId,
+                "RAG_RETRIEVAL_STARTED",
+                "RAG",
+                startPayload,
+                true,
+                null,
+                session
+        );
+
+        List<RagSnippetVO> ragSnippets = knowledgeRetrievalService.retrieveSnippets(
+                request.message(),
+                request.knowledgeBaseIds(),
+                RAG_TOP_K,
+                RAG_MIN_SCORE
+        );
+
+        Map<String, Object> selectedPayload = new LinkedHashMap<>();
+        selectedPayload.put("count", ragSnippets.size());
+        selectedPayload.put("segmentRefs", ragSnippets.stream().map(RagSnippetVO::milvusPrimaryKey).toList());
+        appendTrace(
+                conversation.getId(),
+                requestId,
+                userMessageId,
+                "RAG_SEGMENTS_SELECTED",
+                "RAG",
+                selectedPayload,
+                true,
+                null,
+                session
+        );
+
+        Map<String, Object> finishedPayload = new LinkedHashMap<>();
+        finishedPayload.put("count", ragSnippets.size());
+        finishedPayload.put("knowledgeBaseIds", request.knowledgeBaseIds());
+        appendTrace(
+                conversation.getId(),
+                requestId,
+                userMessageId,
+                "RAG_RETRIEVAL_FINISHED",
+                "RAG",
+                finishedPayload,
+                true,
+                (int) (System.currentTimeMillis() - startedAt),
+                session
+        );
+        return ragSnippets;
+    }
+
+    private boolean isRagEnabled(ConversationDO conversation, ChatSendRequest request) {
+        return request.enableRag() != null ? Boolean.TRUE.equals(request.enableRag()) : Boolean.TRUE.equals(conversation.getEnableRag());
+    }
+
+    private boolean isAgentEnabled(ConversationDO conversation, ChatSendRequest request) {
+        return request.enableAgent() != null ? Boolean.TRUE.equals(request.enableAgent()) : Boolean.TRUE.equals(conversation.getEnableAgent());
     }
 
     private String safeMessage(Throwable throwable) {

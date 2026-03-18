@@ -66,6 +66,20 @@ a {
   backdrop-filter: blur(8px);
 }
 
+.app-nav a {
+  padding: 8px 12px;
+  border-radius: 999px;
+  color: #516172;
+  transition:
+    background-color 160ms ease,
+    color 160ms ease;
+}
+
+.app-nav a.router-link-active {
+  background: #1f4e79;
+  color: #f8fafc;
+}
+
 .app-main {
   max-width: 1200px;
   margin: 0 auto;

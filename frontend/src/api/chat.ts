@@ -5,6 +5,7 @@ export interface ChatSendRequest {
   message: string
   enableRag: boolean
   enableAgent: boolean
+  knowledgeBaseIds?: number[]
 }
 
 export interface ChatRequestAccepted {

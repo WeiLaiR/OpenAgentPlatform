@@ -6,8 +6,11 @@ import java.sql.Statement;
 
 import javax.sql.DataSource;
 
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import com.weilair.openagent.ai.config.OpenAgentMilvusProperties;
+import com.weilair.openagent.knowledge.service.MilvusKnowledgeSchemaService;
 import com.weilair.openagent.web.vo.SystemHealthVO;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -23,24 +26,33 @@ public class SystemHealthService {
     private final ObjectProvider<DataSource> dataSourceProvider;
     private final ObjectProvider<ChatModel> chatModelProvider;
     private final ObjectProvider<StreamingChatModel> streamingChatModelProvider;
+    private final ObjectProvider<EmbeddingModel> embeddingModelProvider;
+    private final MilvusKnowledgeSchemaService milvusKnowledgeSchemaService;
+    private final OpenAgentMilvusProperties milvusProperties;
 
     public SystemHealthService(
             ObjectProvider<DataSource> dataSourceProvider,
             ObjectProvider<ChatModel> chatModelProvider,
-            ObjectProvider<StreamingChatModel> streamingChatModelProvider
+            ObjectProvider<StreamingChatModel> streamingChatModelProvider,
+            ObjectProvider<EmbeddingModel> embeddingModelProvider,
+            MilvusKnowledgeSchemaService milvusKnowledgeSchemaService,
+            OpenAgentMilvusProperties milvusProperties
     ) {
         this.dataSourceProvider = dataSourceProvider;
         this.chatModelProvider = chatModelProvider;
         this.streamingChatModelProvider = streamingChatModelProvider;
+        this.embeddingModelProvider = embeddingModelProvider;
+        this.milvusKnowledgeSchemaService = milvusKnowledgeSchemaService;
+        this.milvusProperties = milvusProperties;
     }
 
     public SystemHealthVO getHealth() {
         return new SystemHealthVO(
                 "UP",
                 checkMysqlStatus(),
-                "NOT_CONFIGURED",
+                checkMilvusStatus(),
                 checkChatModelStatus(),
-                "NOT_CONFIGURED",
+                checkEmbeddingModelStatus(),
                 0,
                 System.currentTimeMillis()
         );
@@ -66,5 +78,14 @@ public class SystemHealthService {
         return chatModelProvider.getIfAvailable() != null || streamingChatModelProvider.getIfAvailable() != null
                 ? "UP"
                 : "NOT_CONFIGURED";
+    }
+
+    private String checkEmbeddingModelStatus() {
+        // 当前同样先看 Bean 是否已经装配成功，真正 embedding 调用健康留到索引 / 检索联调时再做深测。
+        return embeddingModelProvider.getIfAvailable() != null ? "UP" : "NOT_CONFIGURED";
+    }
+
+    private String checkMilvusStatus() {
+        return milvusKnowledgeSchemaService.checkStatus(milvusProperties.getCollection());
     }
 }

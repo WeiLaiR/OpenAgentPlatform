@@ -1,7 +1,11 @@
 package com.weilair.openagent.ai.config;
 
+import java.net.URI;
+
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
@@ -11,7 +15,10 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.util.StringUtils;
 
 @Configuration
-@EnableConfigurationProperties(OpenAgentChatProperties.class)
+@EnableConfigurationProperties({
+        OpenAgentChatProperties.class,
+        OpenAgentEmbeddingProperties.class
+})
 public class OpenAgentAiConfig {
     /**
      * 这一层只负责把 Spring 配置装配成 LangChain4j Bean。
@@ -26,7 +33,7 @@ public class OpenAgentAiConfig {
     public ChatModel chatModel(OpenAgentChatProperties properties) {
         // ChatModel 对应“同步一次性返回完整答案”的调用方式。
         return OpenAiChatModel.builder()
-                .baseUrl(properties.getBaseUrl())
+                .baseUrl(normalizeOpenAiCompatibleBaseUrl(properties.getBaseUrl()))
                 .apiKey(resolveApiKey(properties.getApiKey()))
                 .modelName(properties.getModelName())
                 .temperature(properties.getTemperature())
@@ -43,7 +50,7 @@ public class OpenAgentAiConfig {
     public StreamingChatModel streamingChatModel(OpenAgentChatProperties properties) {
         // StreamingChatModel 对应“边生成边回调 token”的调用方式，后端会把它再映射成 SSE。
         return OpenAiStreamingChatModel.builder()
-                .baseUrl(properties.getBaseUrl())
+                .baseUrl(normalizeOpenAiCompatibleBaseUrl(properties.getBaseUrl()))
                 .apiKey(resolveApiKey(properties.getApiKey()))
                 .modelName(properties.getModelName())
                 .temperature(properties.getTemperature())
@@ -53,8 +60,47 @@ public class OpenAgentAiConfig {
                 .build();
     }
 
+    @Bean
+    @ConditionalOnExpression(
+            "'${openagent.ai.embedding.base-url:}' != '' and '${openagent.ai.embedding.model-name:}' != ''"
+    )
+    public EmbeddingModel embeddingModel(OpenAgentEmbeddingProperties properties) {
+        // EmbeddingModel 会被知识库索引和检索共用，因此这里优先做成全局默认 Bean。
+        return OpenAiEmbeddingModel.builder()
+                .baseUrl(normalizeOpenAiCompatibleBaseUrl(properties.getBaseUrl()))
+                .apiKey(resolveApiKey(properties.getApiKey()))
+                .modelName(properties.getModelName())
+                .timeout(properties.getTimeout())
+                .logRequests(Boolean.TRUE.equals(properties.getLogRequests()))
+                .logResponses(Boolean.TRUE.equals(properties.getLogResponses()))
+                .build();
+    }
+
     private String resolveApiKey(String apiKey) {
         // 有些内网 OpenAI 兼容网关并不校验 api key，但 LangChain4j builder 仍要求提供非空值。
         return StringUtils.hasText(apiKey) ? apiKey : "demo";
+    }
+
+    public static String normalizeOpenAiCompatibleBaseUrl(String baseUrl) {
+        if (!StringUtils.hasText(baseUrl)) {
+            return baseUrl;
+        }
+
+        String normalized = baseUrl.trim();
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+
+        try {
+            URI uri = URI.create(normalized);
+            String path = uri.getPath();
+            if (!StringUtils.hasText(path) || "/".equals(path)) {
+                return normalized + "/v1";
+            }
+        } catch (IllegalArgumentException ignored) {
+            return normalized;
+        }
+
+        return normalized;
     }
 }

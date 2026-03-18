@@ -6,7 +6,9 @@
         <h1 class="app-title">Open Agent Platform</h1>
       </div>
       <nav class="app-nav">
-        <RouterLink to="/">控制台</RouterLink>
+        <RouterLink to="/system">系统</RouterLink>
+        <RouterLink to="/chat">对话</RouterLink>
+        <RouterLink to="/knowledge">知识库</RouterLink>
       </nav>
     </header>
 

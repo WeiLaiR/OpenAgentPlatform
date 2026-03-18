@@ -14,6 +14,10 @@ spring:
 milvus:
   host: 192.1.1.4
   port: 19530
+  database: openagent
+  collection: knowledge_segment
+  partition-prefix: kb_
+  metric-type: IP
 
 openagent:
   ai:
@@ -22,9 +26,10 @@ openagent:
       api-key: demo
       model-name: Qwen3.5-35B-A3B
     embedding:
-      base-url: http://192.1.1.244:5000
+      base-url: http://192.1.1.244:5000/v1
       api-key: demo
       model-name: BAAI/bge-m3
+      dimension: 1024
   storage:
     type: LOCAL
     local:

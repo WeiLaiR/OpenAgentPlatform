@@ -5,10 +5,12 @@ import java.util.List;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import com.weilair.openagent.conversation.model.ConversationDO;
 import com.weilair.openagent.conversation.model.ConversationMessageDO;
 import com.weilair.openagent.conversation.service.ConversationService;
+import com.weilair.openagent.web.vo.RagSnippetVO;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
@@ -37,6 +39,14 @@ public class ChatContextAssembler {
      * 因此这里显式做一次裁剪，只把最近若干轮正式消息映射成模型上下文。
      */
     public List<ChatMessage> assemble(ConversationDO conversation, String currentUserMessage) {
+        return assemble(conversation, currentUserMessage, List.of());
+    }
+
+    public List<ChatMessage> assemble(
+            ConversationDO conversation,
+            String currentUserMessage,
+            List<RagSnippetVO> ragSnippets
+    ) {
         List<ChatMessage> messages = new ArrayList<>();
 
         // 当前会话虽然默认开启 memoryEnabled，但这里先把开关位保留下来，
@@ -50,6 +60,10 @@ public class ChatContextAssembler {
                     messages.add(chatMessage);
                 }
             }
+        }
+
+        if (ragSnippets != null && !ragSnippets.isEmpty()) {
+            messages.add(SystemMessage.from(buildRagContextMessage(ragSnippets)));
         }
 
         // 当前 user message 不提前写回查询结果中，避免把“本轮尚未完成的消息”混进历史裁剪逻辑。
@@ -69,5 +83,27 @@ public class ChatContextAssembler {
             return AiMessage.from(message.getContent());
         }
         return null;
+    }
+
+    private String buildRagContextMessage(List<RagSnippetVO> ragSnippets) {
+        StringBuilder context = new StringBuilder();
+        context.append("以下是从知识库中检索到的参考片段，请优先基于这些内容回答；如果片段不足以支持结论，要明确说明。\n\n");
+        for (int index = 0; index < ragSnippets.size(); index++) {
+            RagSnippetVO snippet = ragSnippets.get(index);
+            context.append("[片段 ").append(index + 1).append("]\n");
+            context.append("knowledgeBaseId=").append(snippet.knowledgeBaseId())
+                    .append(", fileId=").append(snippet.fileId())
+                    .append(", segmentNo=").append(snippet.segmentNo())
+                    .append(", score=").append(snippet.score())
+                    .append("\n");
+            if (StringUtils.hasText(snippet.sourceTitle())) {
+                context.append("标题: ").append(snippet.sourceTitle()).append("\n");
+            }
+            if (StringUtils.hasText(snippet.fullText())) {
+                context.append(snippet.fullText()).append("\n");
+            }
+            context.append("\n");
+        }
+        return context.toString().trim();
     }
 }

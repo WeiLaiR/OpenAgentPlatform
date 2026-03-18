@@ -28,5 +28,24 @@ openagent:
       timeout: ${OPENAGENT_CHAT_TIMEOUT:PT2M}
       log-requests: ${OPENAGENT_CHAT_LOG_REQUESTS:false}
       log-responses: ${OPENAGENT_CHAT_LOG_RESPONSES:false}
+    embedding:
+      base-url: ${OPENAGENT_EMBEDDING_BASE_URL:}
+      api-key: ${OPENAGENT_EMBEDDING_API_KEY:}
+      model-name: ${OPENAGENT_EMBEDDING_MODEL_NAME:}
+      dimension: ${OPENAGENT_EMBEDDING_DIMENSION:1024}
+      timeout: ${OPENAGENT_EMBEDDING_TIMEOUT:PT2M}
+      log-requests: ${OPENAGENT_EMBEDDING_LOG_REQUESTS:false}
+      log-responses: ${OPENAGENT_EMBEDDING_LOG_RESPONSES:false}
   chat:
     session-retention: PT10M
+  storage:
+    type: ${OPENAGENT_STORAGE_TYPE:LOCAL}
+    local:
+      base-dir: ${OPENAGENT_STORAGE_LOCAL_BASE_DIR:}
+
+milvus:
+  database: ${MILVUS_DATABASE:openagent}
+  collection: ${MILVUS_COLLECTION:knowledge_segment}
+  partition-prefix: ${MILVUS_PARTITION_PREFIX:kb_}
+  connect-timeout-ms: ${MILVUS_CONNECT_TIMEOUT_MS:10000}
+  metric-type: ${MILVUS_METRIC_TYPE:COSINE}
