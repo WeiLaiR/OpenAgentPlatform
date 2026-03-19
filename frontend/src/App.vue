@@ -9,6 +9,7 @@
         <RouterLink to="/system">系统</RouterLink>
         <RouterLink to="/chat">对话</RouterLink>
         <RouterLink to="/knowledge">知识库</RouterLink>
+        <RouterLink to="/mcp">MCP</RouterLink>
       </nav>
     </header>
 

@@ -22,6 +22,11 @@ const router = createRouter({
       name: 'knowledge',
       component: () => import('@/views/KnowledgeView.vue'),
     },
+    {
+      path: '/mcp',
+      name: 'mcp',
+      component: () => import('@/views/McpView.vue'),
+    },
   ],
 })
 

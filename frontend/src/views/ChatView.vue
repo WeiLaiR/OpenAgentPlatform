@@ -39,7 +39,7 @@ const availableKnowledgeBases = ref<KnowledgeBase[]>([])
 const knowledgeLoading = ref(false)
 const knowledgeError = ref('')
 const selectedKnowledgeBaseIds = ref<number[]>([])
-const traceFilter = ref<'ALL' | 'RAG' | 'MODEL' | 'FAILED'>('ALL')
+const traceFilter = ref<'ALL' | 'RAG' | 'MODEL' | 'TOOL' | 'FAILED'>('ALL')
 const traceExpandedIds = ref<number[]>([])
 
 let activeChatSource: EventSource | null = null
@@ -527,6 +527,18 @@ function traceTitle(trace: TraceEvent) {
   if (trace.eventType === 'FINAL_RESPONSE_COMPLETED') {
     return '最终响应完成'
   }
+  if (trace.eventType === 'AGENT_TOOLS_ATTACHED') {
+    return '已装配 Agent 工具'
+  }
+  if (trace.eventType === 'AGENT_TOOLS_UNAVAILABLE') {
+    return 'Agent 工具不可用'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_REQUESTED') {
+    return '开始调用工具'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
+    return '工具调用完成'
+  }
   return trace.eventType
 }
 
@@ -545,6 +557,18 @@ function traceDescription(trace: TraceEvent) {
   }
   if (trace.eventType === 'FINAL_RESPONSE_COMPLETED') {
     return '本轮回答已完成生成并落库。'
+  }
+  if (trace.eventType === 'AGENT_TOOLS_ATTACHED') {
+    return '当前会话已为模型挂载可用的 MCP Tool，接下来模型可以按需发起工具调用。'
+  }
+  if (trace.eventType === 'AGENT_TOOLS_UNAVAILABLE') {
+    return '当前开启了 Agent，但没有成功装配可用工具，本轮会退化为普通模型回答。'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_REQUESTED') {
+    return '模型已输出 Tool Call，后端正在通过 LangChain4j 官方 ToolExecutor 执行对应 MCP 工具。'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
+    return '工具执行结果已经回填给模型，后续会继续进入下一轮生成。'
   }
   return ''
 }
@@ -584,6 +608,9 @@ function traceFacts(trace: TraceEvent) {
     return [
       { label: '模式', value: formatScalar(payload.mode) },
       { label: 'RAG 片段数', value: formatScalar(payload.ragSnippetCount) },
+      { label: 'Agent 已开启', value: formatScalar(payload.agentEnabled) },
+      { label: '工具数', value: formatScalar(payload.toolCount) },
+      { label: '模型轮次', value: formatScalar(payload.modelRound) },
     ]
   }
 
@@ -591,6 +618,40 @@ function traceFacts(trace: TraceEvent) {
     return [
       { label: '回答长度', value: formatScalar(payload.answerLength) },
       { label: '耗时', value: trace.costMillis ? `${trace.costMillis} ms` : '未记录' },
+    ]
+  }
+
+  if (trace.eventType === 'AGENT_TOOLS_ATTACHED') {
+    return [
+      { label: '工具数', value: formatScalar(payload.toolCount) },
+      { label: '工具列表', value: formatScalar(payload.toolNames) },
+    ]
+  }
+
+  if (trace.eventType === 'AGENT_TOOLS_UNAVAILABLE') {
+    return [
+      { label: '原因', value: formatScalar(payload.reason) },
+      { label: '消息', value: formatScalar(payload.message) },
+    ]
+  }
+
+  if (trace.eventType === 'TOOL_EXECUTION_REQUESTED') {
+    return [
+      { label: '工具名', value: formatScalar(payload.toolName) },
+      { label: '调用 ID', value: formatScalar(payload.toolCallId) },
+      { label: '模型轮次', value: formatScalar(payload.modelRound) },
+      { label: '参数预览', value: formatScalar(payload.arguments) },
+    ]
+  }
+
+  if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
+    return [
+      { label: '工具名', value: formatScalar(payload.toolName) },
+      { label: '调用 ID', value: formatScalar(payload.toolCallId) },
+      { label: '模型轮次', value: formatScalar(payload.modelRound) },
+      { label: '是否错误', value: formatScalar(payload.isError) },
+      { label: '耗时', value: trace.costMillis ? `${trace.costMillis} ms` : '未记录' },
+      { label: '结果预览', value: formatScalar(payload.resultPreview) },
     ]
   }
 
@@ -615,11 +676,23 @@ function isStructuredTrace(trace: TraceEvent) {
     'RAG_RETRIEVAL_FINISHED',
     'MODEL_REQUEST_STARTED',
     'FINAL_RESPONSE_COMPLETED',
+    'AGENT_TOOLS_ATTACHED',
+    'AGENT_TOOLS_UNAVAILABLE',
+    'TOOL_EXECUTION_REQUESTED',
+    'TOOL_EXECUTION_COMPLETED',
   ].includes(trace.eventType)
 }
 
 function isModelTrace(trace: TraceEvent) {
   return trace.eventType.startsWith('MODEL_') || trace.eventType.startsWith('FINAL_RESPONSE_')
+}
+
+function isToolTrace(trace: TraceEvent) {
+  return (
+    trace.eventType.startsWith('TOOL_') ||
+    trace.eventType.startsWith('AGENT_TOOL') ||
+    trace.eventStage === 'TOOL'
+  )
 }
 
 function isLowValueTrace(trace: TraceEvent) {
@@ -636,6 +709,9 @@ function matchesTraceFilter(trace: TraceEvent) {
   }
   if (traceFilter.value === 'MODEL') {
     return isModelTrace(trace)
+  }
+  if (traceFilter.value === 'TOOL') {
+    return isToolTrace(trace)
   }
   if (traceFilter.value === 'FAILED') {
     return !trace.successFlag
@@ -776,6 +852,9 @@ onBeforeUnmount(() => {
         <el-switch v-model="modeState.enableRag" active-text="RAG" />
         <el-switch v-model="modeState.enableAgent" active-text="Agent" />
       </div>
+      <p class="mode-hint">
+        Agent 模式当前会优先挂载“已启用且健康”的 MCP Server 工具；如果没有可用工具，本轮会自动退化为普通模型回答。
+      </p>
 
       <div class="rag-attach-panel">
         <div class="rag-attach-head">
@@ -890,6 +969,7 @@ onBeforeUnmount(() => {
               <el-option label="全部事件" value="ALL" />
               <el-option label="只看 RAG" value="RAG" />
               <el-option label="只看 MODEL" value="MODEL" />
+              <el-option label="只看 TOOL" value="TOOL" />
               <el-option label="只看失败" value="FAILED" />
             </el-select>
             <el-button link @click="applyDefaultTraceExpansion">按默认折叠</el-button>
@@ -924,7 +1004,8 @@ onBeforeUnmount(() => {
 
       <div v-if="traces.length === 0" class="empty-state">
         当前还没有 trace 事件。发送消息后，这里会展示 `USER_MESSAGE_RECEIVED`、
-        `RAG_RETRIEVAL_STARTED`、`RAG_SEGMENTS_SELECTED`、`FINAL_RESPONSE_COMPLETED` 等过程事件。
+        `RAG_RETRIEVAL_STARTED`、`TOOL_EXECUTION_REQUESTED`、`TOOL_EXECUTION_COMPLETED`、
+        `FINAL_RESPONSE_COMPLETED` 等过程事件。
       </div>
 
       <div v-else-if="filteredTraces.length === 0" class="empty-state">
@@ -1078,6 +1159,13 @@ onBeforeUnmount(() => {
 .chat-actions {
   display: flex;
   gap: 12px;
+}
+
+.mode-hint {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .rag-attach-panel {

@@ -20,6 +20,7 @@ openagent:
       - http://localhost:5173
       - http://127.0.0.1:5173
   ai:
+    http-client-factory: ${OPENAGENT_AI_HTTP_CLIENT_FACTORY:JDK}
     chat:
       base-url: ${OPENAGENT_CHAT_BASE_URL:}
       api-key: ${OPENAGENT_CHAT_API_KEY:}
@@ -42,6 +43,21 @@ openagent:
     type: ${OPENAGENT_STORAGE_TYPE:LOCAL}
     local:
       base-dir: ${OPENAGENT_STORAGE_LOCAL_BASE_DIR:}
+  mcp:
+    client-name: ${OPENAGENT_MCP_CLIENT_NAME:openagent}
+    client-version: ${OPENAGENT_MCP_CLIENT_VERSION:0.0.1}
+    protocol-version: ${OPENAGENT_MCP_PROTOCOL_VERSION:2024-11-05}
+    initialization-timeout: ${OPENAGENT_MCP_INITIALIZATION_TIMEOUT:PT30S}
+    tool-execution-timeout: ${OPENAGENT_MCP_TOOL_EXECUTION_TIMEOUT:PT60S}
+    resources-timeout: ${OPENAGENT_MCP_RESOURCES_TIMEOUT:PT60S}
+    prompts-timeout: ${OPENAGENT_MCP_PROMPTS_TIMEOUT:PT60S}
+    ping-timeout: ${OPENAGENT_MCP_PING_TIMEOUT:PT10S}
+    reconnect-interval: ${OPENAGENT_MCP_RECONNECT_INTERVAL:PT5S}
+    http-timeout: ${OPENAGENT_MCP_HTTP_TIMEOUT:PT20S}
+    log-events: ${OPENAGENT_MCP_LOG_EVENTS:false}
+    log-requests: ${OPENAGENT_MCP_LOG_REQUESTS:false}
+    log-responses: ${OPENAGENT_MCP_LOG_RESPONSES:false}
+    subsidiary-channel: ${OPENAGENT_MCP_SUBSIDIARY_CHANNEL:false}
 
 milvus:
   database: ${MILVUS_DATABASE:openagent}

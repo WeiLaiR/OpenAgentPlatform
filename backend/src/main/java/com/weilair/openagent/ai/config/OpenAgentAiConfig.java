@@ -16,10 +16,20 @@ import org.springframework.util.StringUtils;
 
 @Configuration
 @EnableConfigurationProperties({
+        OpenAgentLangChain4jProperties.class,
         OpenAgentChatProperties.class,
         OpenAgentEmbeddingProperties.class
 })
 public class OpenAgentAiConfig {
+    static final String LANGCHAIN4J_HTTP_CLIENT_FACTORY_PROPERTY = "langchain4j.http.clientBuilderFactory";
+    static final String JDK_HTTP_CLIENT_FACTORY_CLASS =
+            "dev.langchain4j.http.client.jdk.JdkHttpClientBuilderFactory";
+    static final String SPRING_REST_CLIENT_FACTORY_CLASS =
+            "dev.langchain4j.http.client.spring.restclient.SpringRestClientBuilderFactory";
+    public OpenAgentAiConfig(OpenAgentLangChain4jProperties langChain4jProperties) {
+        configureLangChain4jHttpClientFactory(langChain4jProperties.getHttpClientFactory());
+    }
+
     /**
      * 这一层只负责把 Spring 配置装配成 LangChain4j Bean。
      * 当前没有使用 LangChain4j 官方 starter 自动生成 ChatModel，
@@ -79,6 +89,30 @@ public class OpenAgentAiConfig {
     private String resolveApiKey(String apiKey) {
         // 有些内网 OpenAI 兼容网关并不校验 api key，但 LangChain4j builder 仍要求提供非空值。
         return StringUtils.hasText(apiKey) ? apiKey : "demo";
+    }
+
+    static void configureLangChain4jHttpClientFactory(String configuredFactory) {
+        // 允许外部通过 JVM system property 覆盖；项目配置只作为默认兜底。
+        if (StringUtils.hasText(System.getProperty(LANGCHAIN4J_HTTP_CLIENT_FACTORY_PROPERTY))) {
+            return;
+        }
+
+        System.setProperty(
+                LANGCHAIN4J_HTTP_CLIENT_FACTORY_PROPERTY,
+                resolveLangChain4jHttpClientFactory(configuredFactory)
+        );
+    }
+
+    static String resolveLangChain4jHttpClientFactory(String configuredFactory) {
+        if (!StringUtils.hasText(configuredFactory)) {
+            return JDK_HTTP_CLIENT_FACTORY_CLASS;
+        }
+
+        return switch (configuredFactory.trim().toUpperCase()) {
+            case "JDK" -> JDK_HTTP_CLIENT_FACTORY_CLASS;
+            case "SPRING_REST_CLIENT", "SPRING_REST" -> SPRING_REST_CLIENT_FACTORY_CLASS;
+            default -> configuredFactory.trim();
+        };
     }
 
     public static String normalizeOpenAiCompatibleBaseUrl(String baseUrl) {

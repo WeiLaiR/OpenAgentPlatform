@@ -99,6 +99,10 @@ onMounted(loadHealth)
           <strong>进入知识库页</strong>
           <span>创建知识库、上传文件、触发索引并做检索测试。</span>
         </RouterLink>
+        <RouterLink class="jump-card" to="/mcp">
+          <strong>进入 MCP 页</strong>
+          <span>管理 MCP Server、测试连通性并同步可用工具快照。</span>
+        </RouterLink>
       </div>
     </el-card>
 

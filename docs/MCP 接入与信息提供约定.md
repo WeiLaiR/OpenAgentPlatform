@@ -2,6 +2,11 @@
 
 本文档用于统一后续 MCP 接入时的沟通格式，并明确当前项目的落地边界。
 
+补充说明：
+
+- 如果你关注的是“Windows / Linux 下到底该怎么填 `STDIO` 命令、`npx` 能不能直接用、平台会不会自动安装 MCP”，请同时阅读：
+  - `docs/MCP Server 运行与配置说明（Windows、Linux）.md`
+
 ## 1. 先说结论
 
 本项目中的 MCP Server 信息，目标落地方式是：

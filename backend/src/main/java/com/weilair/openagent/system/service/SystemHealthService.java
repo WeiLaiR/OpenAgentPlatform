@@ -11,6 +11,7 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import com.weilair.openagent.ai.config.OpenAgentMilvusProperties;
 import com.weilair.openagent.knowledge.service.MilvusKnowledgeSchemaService;
+import com.weilair.openagent.mcp.service.McpServerService;
 import com.weilair.openagent.web.vo.SystemHealthVO;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -29,6 +30,7 @@ public class SystemHealthService {
     private final ObjectProvider<EmbeddingModel> embeddingModelProvider;
     private final MilvusKnowledgeSchemaService milvusKnowledgeSchemaService;
     private final OpenAgentMilvusProperties milvusProperties;
+    private final ObjectProvider<McpServerService> mcpServerServiceProvider;
 
     public SystemHealthService(
             ObjectProvider<DataSource> dataSourceProvider,
@@ -36,7 +38,8 @@ public class SystemHealthService {
             ObjectProvider<StreamingChatModel> streamingChatModelProvider,
             ObjectProvider<EmbeddingModel> embeddingModelProvider,
             MilvusKnowledgeSchemaService milvusKnowledgeSchemaService,
-            OpenAgentMilvusProperties milvusProperties
+            OpenAgentMilvusProperties milvusProperties,
+            ObjectProvider<McpServerService> mcpServerServiceProvider
     ) {
         this.dataSourceProvider = dataSourceProvider;
         this.chatModelProvider = chatModelProvider;
@@ -44,6 +47,7 @@ public class SystemHealthService {
         this.embeddingModelProvider = embeddingModelProvider;
         this.milvusKnowledgeSchemaService = milvusKnowledgeSchemaService;
         this.milvusProperties = milvusProperties;
+        this.mcpServerServiceProvider = mcpServerServiceProvider;
     }
 
     public SystemHealthVO getHealth() {
@@ -53,7 +57,7 @@ public class SystemHealthService {
                 checkMilvusStatus(),
                 checkChatModelStatus(),
                 checkEmbeddingModelStatus(),
-                0,
+                countHealthyMcpServers(),
                 System.currentTimeMillis()
         );
     }
@@ -87,5 +91,10 @@ public class SystemHealthService {
 
     private String checkMilvusStatus() {
         return milvusKnowledgeSchemaService.checkStatus(milvusProperties.getCollection());
+    }
+
+    private Integer countHealthyMcpServers() {
+        McpServerService mcpServerService = mcpServerServiceProvider.getIfAvailable();
+        return mcpServerService != null ? mcpServerService.countHealthyServers() : 0;
     }
 }

@@ -1,15 +1,22 @@
 package com.weilair.openagent.chat.service;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import dev.langchain4j.invocation.InvocationContext;
+import dev.langchain4j.invocation.InvocationParameters;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import com.weilair.openagent.chat.exception.ChatServiceUnavailableException;
@@ -18,6 +25,8 @@ import com.weilair.openagent.common.request.RequestIdContext;
 import com.weilair.openagent.conversation.model.ConversationDO;
 import com.weilair.openagent.conversation.service.ConversationService;
 import com.weilair.openagent.knowledge.service.KnowledgeRetrievalService;
+import com.weilair.openagent.mcp.service.McpToolRuntimeService;
+import com.weilair.openagent.mcp.service.McpToolRuntimeService.McpToolRuntime;
 import com.weilair.openagent.trace.service.TraceService;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
@@ -46,6 +55,7 @@ public class ChatGenerationService {
 
     private static final int RAG_TOP_K = 4;
     private static final double RAG_MIN_SCORE = 0.55d;
+    private static final int MAX_AGENT_TOOL_ROUNDS = 8;
 
     private final ObjectProvider<ChatModel> chatModelProvider;
     private final ObjectProvider<StreamingChatModel> streamingChatModelProvider;
@@ -53,6 +63,7 @@ public class ChatGenerationService {
     private final ChatContextAssembler chatContextAssembler;
     private final ConversationService conversationService;
     private final KnowledgeRetrievalService knowledgeRetrievalService;
+    private final McpToolRuntimeService mcpToolRuntimeService;
     private final TraceService traceService;
     private final ConversationExecutionGuard executionGuard;
     private final ExecutorService executorService;
@@ -64,6 +75,7 @@ public class ChatGenerationService {
             ChatContextAssembler chatContextAssembler,
             ConversationService conversationService,
             KnowledgeRetrievalService knowledgeRetrievalService,
+            McpToolRuntimeService mcpToolRuntimeService,
             TraceService traceService,
             ConversationExecutionGuard executionGuard
     ) {
@@ -73,6 +85,7 @@ public class ChatGenerationService {
         this.chatContextAssembler = chatContextAssembler;
         this.conversationService = conversationService;
         this.knowledgeRetrievalService = knowledgeRetrievalService;
+        this.mcpToolRuntimeService = mcpToolRuntimeService;
         this.traceService = traceService;
         this.executionGuard = executionGuard;
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
@@ -104,24 +117,21 @@ public class ChatGenerationService {
                     null,
                     null
             );
-            appendTrace(
-                    conversation.getId(),
+            ChatRoundResult roundResult = generateSyncAnswer(
+                    chatModel,
+                    conversation,
+                    request,
                     requestId,
                     userMessageId,
-                    "MODEL_REQUEST_STARTED",
-                    "MODEL",
-                    modelStartPayload("SYNC", ragSnippets.size()),
-                    true,
-                    null,
+                    contextMessages,
+                    ragSnippets.size(),
                     null
             );
-
-            String answer = chatModel.chat(contextMessages).aiMessage().text();
             Long assistantMessageId = conversationService.saveAssistantMessage(
                     conversation.getId(),
                     requestId,
                     userMessageId,
-                    answer,
+                    roundResult.answer(),
                     "stop",
                     null
             );
@@ -132,7 +142,7 @@ public class ChatGenerationService {
                     assistantMessageId,
                     "FINAL_RESPONSE_COMPLETED",
                     "COMPLETED",
-                    tracePayload("answerLength", answer.length()),
+                    tracePayload("answerLength", roundResult.answer().length()),
                     true,
                     (int) elapsedMillis,
                     null
@@ -141,10 +151,10 @@ public class ChatGenerationService {
             return new ChatAnswerVO(
                     requestId,
                     conversation.getId(),
-                    answer,
+                    roundResult.answer(),
                     "stop",
                     !ragSnippets.isEmpty(),
-                    isAgentEnabled(conversation, request),
+                    roundResult.usedTools(),
                     elapsedMillis
             );
         } finally {
@@ -157,9 +167,9 @@ public class ChatGenerationService {
      * 它同时也是 trace_event 和 conversation_message 关联的业务主键。
      */
     public ChatRequestAcceptedVO submit(ChatSendRequest request) {
-        StreamingChatModel streamingChatModel = requireStreamingChatModel();
         ConversationDO conversation = conversationService.resolveConversation(request);
         ChatStreamSession session = sessionStore.create(conversation.getId());
+        boolean agentEnabled = isAgentEnabled(conversation, request);
         executionGuard.acquire(conversation.getId(), session.requestId());
 
         try {
@@ -190,7 +200,13 @@ public class ChatGenerationService {
             );
 
             executorService.submit(() -> emitThinkingProgress(session));
-            executorService.submit(() -> streamAnswer(streamingChatModel, session, contextMessages, ragSnippets.size()));
+            if (agentEnabled) {
+                ChatModel chatModel = requireChatModel();
+                executorService.submit(() -> runAgentRoundAndEmit(chatModel, session, conversation, request, contextMessages, ragSnippets.size()));
+            } else {
+                StreamingChatModel streamingChatModel = requireStreamingChatModel();
+                executorService.submit(() -> streamAnswer(streamingChatModel, session, contextMessages, ragSnippets.size()));
+            }
 
             return new ChatRequestAcceptedVO(
                     session.requestId(),
@@ -226,7 +242,7 @@ public class ChatGenerationService {
                 "MODEL_REQUEST_STARTED",
                 "MODEL",
                 session.userMessageId(),
-                modelStartPayload("STREAM", ragSnippetCount),
+                modelStartPayload("STREAM", ragSnippetCount, false, 0, 1),
                 true,
                 null
         );
@@ -372,6 +388,386 @@ public class ChatGenerationService {
         }
     }
 
+    /**
+     * 当前 Agent 版先优先保证 “MCP tool 能稳定调用” 这件事成立：
+     * - 普通聊天继续走原来的真流式回调
+     * - Agent 模式先在后台完成 tool loop，再通过 SSE 返回最终答案
+     *
+     * 这样做的原因是：tool calling 会引入多轮模型/工具往返，
+     * 如果在这一阶段同时追求“真流式 token + 多轮 tool loop”，实现会明显更脆弱。
+     * 等后续进入更完整的 Agent 编排阶段，再把这里升级为更细粒度的流式回调。
+     */
+    private void runAgentRoundAndEmit(
+            ChatModel chatModel,
+            ChatStreamSession session,
+            ConversationDO conversation,
+            ChatSendRequest request,
+            List<ChatMessage> contextMessages,
+            int ragSnippetCount
+    ) {
+        session.status("RUNNING");
+        long startedAt = System.currentTimeMillis();
+
+        try {
+            ChatRoundResult roundResult = generateSyncAnswer(
+                    chatModel,
+                    conversation,
+                    request,
+                    session.requestId(),
+                    session.userMessageId(),
+                    contextMessages,
+                    ragSnippetCount,
+                    session
+            );
+            session.appendAnswer(roundResult.answer());
+            Long assistantMessageId = conversationService.saveAssistantMessage(
+                    session.conversationId(),
+                    session.requestId(),
+                    session.userMessageId(),
+                    roundResult.answer(),
+                    "stop",
+                    null
+            );
+
+            sessionStore.appendEvent(
+                    session,
+                    "message_end",
+                    new ChatStreamCompletedVO(session.requestId(), roundResult.answer(), "stop")
+            );
+            appendTrace(
+                    session,
+                    "FINAL_RESPONSE_COMPLETED",
+                    "COMPLETED",
+                    assistantMessageId,
+                    tracePayload("answerLength", roundResult.answer().length()),
+                    true,
+                    (int) (System.currentTimeMillis() - startedAt)
+            );
+            sessionStore.complete(session);
+        } catch (Exception exception) {
+            try {
+                Long assistantMessageId = conversationService.saveAssistantMessage(
+                        session.conversationId(),
+                        session.requestId(),
+                        session.userMessageId(),
+                        "",
+                        "error",
+                        safeMessage(exception)
+                );
+                appendTrace(
+                        session,
+                        "ERROR_OCCURRED",
+                        "FAILED",
+                        assistantMessageId,
+                        tracePayload("message", safeMessage(exception)),
+                        false,
+                        (int) (System.currentTimeMillis() - startedAt)
+                );
+            } finally {
+                sessionStore.fail(session, safeMessage(exception));
+            }
+        } finally {
+            executionGuard.release(session.conversationId(), session.requestId());
+        }
+    }
+
+    private ChatRoundResult generateSyncAnswer(
+            ChatModel chatModel,
+            ConversationDO conversation,
+            ChatSendRequest request,
+            String requestId,
+            Long userMessageId,
+            List<ChatMessage> contextMessages,
+            int ragSnippetCount,
+            ChatStreamSession session
+    ) {
+        /**
+         * 这里统一承担“同步聊天”和“Agent tool loop”两条路径：
+         * 1. 没开 Agent，或没有可用工具时，直接走普通 ChatModel.chat(messages)
+         * 2. 有可用工具时，改走 LangChain4j 官方 ChatRequest + toolSpecifications
+         *
+         * 这样做的目的，是把 Tool Calling 明确收敛到 LangChain4j 官方抽象上，
+         * 避免项目自己再发明一套“模型请求 + 工具执行”的协议层。
+         */
+        boolean agentEnabled = isAgentEnabled(conversation, request);
+
+        try (McpToolRuntime toolRuntime = openToolRuntime(conversation, request, requestId, userMessageId, session)) {
+            if (!agentEnabled || !toolRuntime.hasTools()) {
+                appendTrace(
+                        conversation.getId(),
+                        requestId,
+                        userMessageId,
+                        "MODEL_REQUEST_STARTED",
+                        "MODEL",
+                        modelStartPayload("SYNC", ragSnippetCount, agentEnabled, 0, 1),
+                        true,
+                        null,
+                        session
+                );
+
+                ChatResponse response = chatModel.chat(contextMessages);
+                return new ChatRoundResult(resolveAnswerText(response.aiMessage()), false);
+            }
+
+            List<ChatMessage> messages = new ArrayList<>(contextMessages);
+            boolean usedTools = false;
+
+            for (int round = 1; round <= MAX_AGENT_TOOL_ROUNDS; round++) {
+                appendTrace(
+                        conversation.getId(),
+                        requestId,
+                        userMessageId,
+                        "MODEL_REQUEST_STARTED",
+                        "MODEL",
+                        modelStartPayload("SYNC", ragSnippetCount, true, toolRuntime.toolCount(), round),
+                        true,
+                        null,
+                        session
+                );
+
+                ChatResponse response = chatModel.chat(buildToolChatRequest(messages, toolRuntime));
+                AiMessage aiMessage = response.aiMessage();
+                if (aiMessage != null && aiMessage.hasToolExecutionRequests()) {
+                    usedTools = true;
+                    messages.add(aiMessage);
+                    messages.addAll(executeToolRequests(
+                            toolRuntime,
+                            aiMessage.toolExecutionRequests(),
+                            conversation,
+                            requestId,
+                            userMessageId,
+                            round,
+                            session
+                    ));
+                    continue;
+                }
+
+                return new ChatRoundResult(resolveAnswerText(aiMessage), usedTools);
+            }
+        }
+
+        throw new IllegalStateException("Agent 工具调用轮次超过限制，请检查模型输出或工具配置。");
+    }
+
+    private McpToolRuntime openToolRuntime(
+            ConversationDO conversation,
+            ChatSendRequest request,
+            String requestId,
+            Long userMessageId,
+            ChatStreamSession session
+    ) {
+        /**
+         * Tool runtime 的职责是把“平台配置层的 MCP Server / Tool 快照”
+         * 转成“当前这一轮聊天真正可挂到模型上的 Tool 集合”。
+         *
+         * 当前策略先按“所有已启用且健康的工具都可用”处理；
+         * 会话级绑定 `conversation_mcp_binding` 留到下一阶段再接入。
+         */
+        if (!isAgentEnabled(conversation, request)) {
+            return McpToolRuntime.empty();
+        }
+
+        try {
+            McpToolRuntime runtime = mcpToolRuntimeService.openRuntime(conversation.getId(), request.message());
+            if (runtime.hasTools()) {
+                appendTrace(
+                        conversation.getId(),
+                        requestId,
+                        userMessageId,
+                        "AGENT_TOOLS_ATTACHED",
+                        "TOOL",
+                        agentToolsPayload(runtime.toolCount(), runtime.toolNames()),
+                        true,
+                        null,
+                        session
+                );
+            } else {
+                appendTrace(
+                        conversation.getId(),
+                        requestId,
+                        userMessageId,
+                        "AGENT_TOOLS_UNAVAILABLE",
+                        "TOOL",
+                        tracePayload("reason", "NO_ENABLED_TOOLS"),
+                        true,
+                        null,
+                        session
+                );
+            }
+            return runtime;
+        } catch (Exception exception) {
+            appendTrace(
+                    conversation.getId(),
+                    requestId,
+                    userMessageId,
+                    "AGENT_TOOLS_UNAVAILABLE",
+                    "TOOL",
+                    Map.of(
+                            "reason", "LOAD_FAILED",
+                            "message", safeMessage(exception)
+                    ),
+                    false,
+                    null,
+                    session
+            );
+            return McpToolRuntime.empty();
+        }
+    }
+
+    private List<ToolExecutionResultMessage> executeToolRequests(
+            McpToolRuntime toolRuntime,
+            List<ToolExecutionRequest> toolExecutionRequests,
+            ConversationDO conversation,
+            String requestId,
+            Long userMessageId,
+            int modelRound,
+            ChatStreamSession session
+    ) {
+        /**
+         * LangChain4j 在这里把模型输出的 tool call 表达为 ToolExecutionRequest；
+         * 我们负责逐个执行，并把结果重新包装成 ToolExecutionResultMessage，
+         * 再交回模型进入下一轮推理。
+         */
+        List<ToolExecutionResultMessage> resultMessages = new ArrayList<>();
+
+        for (ToolExecutionRequest toolExecutionRequest : toolExecutionRequests) {
+            if (session != null) {
+                sessionStore.sendTransientEvent(
+                        session,
+                        "progress",
+                        new ChatStreamProgressVO(
+                                requestId,
+                                "CALLING_TOOL",
+                                "正在调用工具 " + toolExecutionRequest.name() + " ...",
+                                0L
+                        )
+                );
+            }
+
+            appendTrace(
+                    conversation.getId(),
+                    requestId,
+                    userMessageId,
+                    "TOOL_EXECUTION_REQUESTED",
+                    "TOOL",
+                    toolRequestPayload(toolExecutionRequest, modelRound),
+                    true,
+                    null,
+                    session
+            );
+
+            long startedAt = System.currentTimeMillis();
+            ToolExecutionResultMessage resultMessage = executeSingleToolRequest(
+                    toolRuntime,
+                    toolExecutionRequest,
+                    conversation,
+                    requestId
+            );
+
+            appendTrace(
+                    conversation.getId(),
+                    requestId,
+                    userMessageId,
+                    "TOOL_EXECUTION_COMPLETED",
+                    "TOOL",
+                    toolResultPayload(resultMessage, modelRound),
+                    !Boolean.TRUE.equals(resultMessage.isError()),
+                    (int) (System.currentTimeMillis() - startedAt),
+                    session
+            );
+
+            resultMessages.add(resultMessage);
+        }
+
+        return resultMessages;
+    }
+
+    private ToolExecutionResultMessage executeSingleToolRequest(
+            McpToolRuntime toolRuntime,
+            ToolExecutionRequest toolExecutionRequest,
+            ConversationDO conversation,
+            String requestId
+    ) {
+        /**
+         * 真正的工具执行完全委托给 LangChain4j 官方 ToolExecutor。
+         * 这里自己保留的只是运行时上下文补充和错误兜底，
+         * 目的是让失败结果也能回填给模型，而不是直接打断整轮 Agent 流程。
+         */
+        try {
+            var toolExecutor = toolRuntime.toolExecutor(toolExecutionRequest.name());
+            if (toolExecutor == null) {
+                return ToolExecutionResultMessage.builder()
+                        .id(toolExecutionRequest.id())
+                        .toolName(toolExecutionRequest.name())
+                        .text("Tool executor not found for " + toolExecutionRequest.name())
+                        .isError(Boolean.TRUE)
+                        .build();
+            }
+
+            var result = toolExecutor.executeWithContext(
+                    toolExecutionRequest,
+                    buildInvocationContext(conversation.getId(), requestId)
+            );
+            String resultText = resolveToolResultText(result);
+            return ToolExecutionResultMessage.builder()
+                    .id(toolExecutionRequest.id())
+                    .toolName(toolExecutionRequest.name())
+                    .text(resultText)
+                    .isError(result.isError())
+                    .build();
+        } catch (Exception exception) {
+            return ToolExecutionResultMessage.builder()
+                    .id(toolExecutionRequest.id())
+                    .toolName(toolExecutionRequest.name())
+                    .text(safeMessage(exception))
+                    .isError(Boolean.TRUE)
+                    .build();
+        }
+    }
+
+    private ChatRequest buildToolChatRequest(List<ChatMessage> messages, McpToolRuntime toolRuntime) {
+        /**
+         * 只有进入 Agent/tool loop 时，才需要把 `toolSpecifications`
+         * 挂到 ChatRequest 上，让模型明确知道当前这轮可调用哪些工具。
+         */
+        return ChatRequest.builder()
+                .messages(messages)
+                .toolSpecifications(toolRuntime.toolSpecifications())
+                .build();
+    }
+
+    private InvocationContext buildInvocationContext(Long conversationId, String requestId) {
+        return InvocationContext.builder()
+                .invocationId(UUID.randomUUID())
+                .interfaceName("ChatGenerationService")
+                .methodName("agentToolRound")
+                .chatMemoryId(conversationId)
+                .methodArguments(List.of(requestId))
+                .invocationParameters(InvocationParameters.from(Map.of(
+                        "conversationId", conversationId,
+                        "requestId", requestId
+                )))
+                .timestampNow()
+                .build();
+    }
+
+    private String resolveAnswerText(AiMessage aiMessage) {
+        if (aiMessage == null || aiMessage.text() == null || aiMessage.text().isBlank()) {
+            return "";
+        }
+        return aiMessage.text();
+    }
+
+    private String resolveToolResultText(dev.langchain4j.service.tool.ToolExecutionResult result) {
+        if (result == null) {
+            return "";
+        }
+        if (result.resultText() != null && !result.resultText().isBlank()) {
+            return result.resultText();
+        }
+        return result.result() == null ? "" : String.valueOf(result.result());
+    }
+
     private TraceEventVO appendTrace(
             ChatStreamSession session,
             String eventType,
@@ -426,10 +822,45 @@ public class ChatGenerationService {
         return Map.of(key, value == null ? "" : value);
     }
 
-    private Map<String, Object> modelStartPayload(String mode, int ragSnippetCount) {
+    private Map<String, Object> modelStartPayload(
+            String mode,
+            int ragSnippetCount,
+            boolean agentEnabled,
+            int toolCount,
+            int modelRound
+    ) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("mode", mode);
         payload.put("ragSnippetCount", ragSnippetCount);
+        payload.put("agentEnabled", agentEnabled);
+        payload.put("toolCount", toolCount);
+        payload.put("modelRound", modelRound);
+        return payload;
+    }
+
+    private Map<String, Object> agentToolsPayload(int toolCount, List<String> toolNames) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("toolCount", toolCount);
+        payload.put("toolNames", toolNames);
+        return payload;
+    }
+
+    private Map<String, Object> toolRequestPayload(ToolExecutionRequest toolExecutionRequest, int modelRound) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("toolCallId", toolExecutionRequest.id());
+        payload.put("toolName", toolExecutionRequest.name());
+        payload.put("modelRound", modelRound);
+        payload.put("arguments", shorten(toolExecutionRequest.arguments(), 1000));
+        return payload;
+    }
+
+    private Map<String, Object> toolResultPayload(ToolExecutionResultMessage resultMessage, int modelRound) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("toolCallId", resultMessage.id());
+        payload.put("toolName", resultMessage.toolName());
+        payload.put("modelRound", modelRound);
+        payload.put("isError", Boolean.TRUE.equals(resultMessage.isError()));
+        payload.put("resultPreview", shorten(resultMessage.text(), 1000));
         return payload;
     }
 
@@ -508,11 +939,24 @@ public class ChatGenerationService {
         return request.enableAgent() != null ? Boolean.TRUE.equals(request.enableAgent()) : Boolean.TRUE.equals(conversation.getEnableAgent());
     }
 
+    private String shorten(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, maxLength) + "...";
+    }
+
     private String safeMessage(Throwable throwable) {
         if (throwable == null || throwable.getMessage() == null || throwable.getMessage().isBlank()) {
             return "未知错误";
         }
         return throwable.getMessage();
+    }
+
+    private record ChatRoundResult(
+            String answer,
+            boolean usedTools
+    ) {
     }
 
     private ChatModel requireChatModel() {
