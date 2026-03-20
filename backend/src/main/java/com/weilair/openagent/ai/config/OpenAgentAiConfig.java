@@ -2,9 +2,9 @@ package com.weilair.openagent.ai.config;
 
 import java.net.URI;
 
-import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
@@ -18,7 +18,8 @@ import org.springframework.util.StringUtils;
 @EnableConfigurationProperties({
         OpenAgentLangChain4jProperties.class,
         OpenAgentChatProperties.class,
-        OpenAgentEmbeddingProperties.class
+        OpenAgentEmbeddingProperties.class,
+        OpenAgentMemoryProperties.class
 })
 public class OpenAgentAiConfig {
     static final String LANGCHAIN4J_HTTP_CLIENT_FACTORY_PROPERTY = "langchain4j.http.clientBuilderFactory";

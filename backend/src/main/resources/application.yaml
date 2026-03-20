@@ -25,6 +25,7 @@ openagent:
       base-url: ${OPENAGENT_CHAT_BASE_URL:}
       api-key: ${OPENAGENT_CHAT_API_KEY:}
       model-name: ${OPENAGENT_CHAT_MODEL_NAME:}
+      tokenizer-model-name: ${OPENAGENT_CHAT_TOKENIZER_MODEL_NAME:}
       temperature: ${OPENAGENT_CHAT_TEMPERATURE:0.2}
       timeout: ${OPENAGENT_CHAT_TIMEOUT:PT2M}
       log-requests: ${OPENAGENT_CHAT_LOG_REQUESTS:false}
@@ -37,6 +38,11 @@ openagent:
       timeout: ${OPENAGENT_EMBEDDING_TIMEOUT:PT2M}
       log-requests: ${OPENAGENT_EMBEDDING_LOG_REQUESTS:false}
       log-responses: ${OPENAGENT_EMBEDDING_LOG_RESPONSES:false}
+    memory:
+      default-enabled: ${OPENAGENT_MEMORY_DEFAULT_ENABLED:true}
+      max-messages: ${OPENAGENT_MEMORY_MAX_MESSAGES:20}
+      max-tokens: ${OPENAGENT_MEMORY_MAX_TOKENS:4000}
+      always-keep-system-message-first: ${OPENAGENT_MEMORY_ALWAYS_KEEP_SYSTEM_MESSAGE_FIRST:true}
   chat:
     session-retention: PT10M
   storage:

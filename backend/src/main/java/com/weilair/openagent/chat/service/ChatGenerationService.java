@@ -56,6 +56,8 @@ public class ChatGenerationService {
     private static final int RAG_TOP_K = 4;
     private static final double RAG_MIN_SCORE = 0.55d;
     private static final int MAX_AGENT_TOOL_ROUNDS = 8;
+    private static final int FALLBACK_STREAM_CHUNK_CODE_POINTS = 24;
+    private static final long FALLBACK_STREAM_DELAY_MILLIS = 15L;
 
     private final ObjectProvider<ChatModel> chatModelProvider;
     private final ObjectProvider<StreamingChatModel> streamingChatModelProvider;
@@ -105,7 +107,8 @@ public class ChatGenerationService {
             long startedAt = System.currentTimeMillis();
             Long userMessageId = conversationService.saveUserMessage(conversation.getId(), requestId, request.message());
             List<RagSnippetVO> ragSnippets = retrieveRagSnippets(conversation, request, requestId, userMessageId, null);
-            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
+            ChatContextAssembler.ChatContextSnapshot chatContext =
+                    chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
             appendTrace(
                     conversation.getId(),
                     requestId,
@@ -123,7 +126,7 @@ public class ChatGenerationService {
                     request,
                     requestId,
                     userMessageId,
-                    contextMessages,
+                    chatContext,
                     ragSnippets.size(),
                     null
             );
@@ -135,6 +138,7 @@ public class ChatGenerationService {
                     "stop",
                     null
             );
+            applyChatMemoryUpdate(chatContext, roundResult);
             long elapsedMillis = System.currentTimeMillis() - startedAt;
             appendTrace(
                     conversation.getId(),
@@ -182,7 +186,8 @@ public class ChatGenerationService {
                     userMessageId,
                     session
             );
-            List<ChatMessage> contextMessages = chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
+            ChatContextAssembler.ChatContextSnapshot chatContext =
+                    chatContextAssembler.assemble(conversation, request.message(), ragSnippets);
 
             sessionStore.appendEvent(
                     session,
@@ -202,10 +207,10 @@ public class ChatGenerationService {
             executorService.submit(() -> emitThinkingProgress(session));
             if (agentEnabled) {
                 ChatModel chatModel = requireChatModel();
-                executorService.submit(() -> runAgentRoundAndEmit(chatModel, session, conversation, request, contextMessages, ragSnippets.size()));
+                executorService.submit(() -> runAgentRoundAndEmit(chatModel, session, conversation, request, chatContext, ragSnippets.size()));
             } else {
                 StreamingChatModel streamingChatModel = requireStreamingChatModel();
-                executorService.submit(() -> streamAnswer(streamingChatModel, session, contextMessages, ragSnippets.size()));
+                executorService.submit(() -> streamAnswer(streamingChatModel, session, chatContext, ragSnippets.size()));
             }
 
             return new ChatRequestAcceptedVO(
@@ -232,7 +237,7 @@ public class ChatGenerationService {
     private void streamAnswer(
             StreamingChatModel streamingChatModel,
             ChatStreamSession session,
-            List<ChatMessage> messages,
+            ChatContextAssembler.ChatContextSnapshot chatContext,
             int ragSnippetCount
     ) {
         session.status("RUNNING");
@@ -248,21 +253,11 @@ public class ChatGenerationService {
         );
 
         try {
-            streamingChatModel.chat(messages, new StreamingChatResponseHandler() {
+            streamingChatModel.chat(chatContext.requestMessages(), new StreamingChatResponseHandler() {
             @Override
             public void onPartialResponse(String partialResponse) {
                 session.appendAnswer(partialResponse);
-                if (session.markTraceStreamingStarted()) {
-                    appendTrace(
-                            session,
-                            "FINAL_RESPONSE_STREAMING",
-                            "STREAM",
-                            session.userMessageId(),
-                            tracePayload("status", "FIRST_TOKEN"),
-                            true,
-                            null
-                    );
-                }
+                markResponseStreamingStarted(session);
                 sessionStore.appendEvent(
                         session,
                         "token",
@@ -275,6 +270,7 @@ public class ChatGenerationService {
                 try {
                     AiMessage aiMessage = completeResponse.aiMessage();
                     String answer = aiMessage != null && aiMessage.text() != null ? aiMessage.text() : session.answer();
+                    emitAnswerTokens(session, answer);
                     Long assistantMessageId = conversationService.saveAssistantMessage(
                             session.conversationId(),
                             session.requestId(),
@@ -283,6 +279,7 @@ public class ChatGenerationService {
                             "stop",
                             null
                     );
+                    applyChatMemoryUpdate(chatContext, new ChatRoundResult(answer, false, aiMessage, null));
 
                     sessionStore.appendEvent(
                             session,
@@ -402,7 +399,7 @@ public class ChatGenerationService {
             ChatStreamSession session,
             ConversationDO conversation,
             ChatSendRequest request,
-            List<ChatMessage> contextMessages,
+            ChatContextAssembler.ChatContextSnapshot chatContext,
             int ragSnippetCount
     ) {
         session.status("RUNNING");
@@ -415,11 +412,12 @@ public class ChatGenerationService {
                     request,
                     session.requestId(),
                     session.userMessageId(),
-                    contextMessages,
+                    chatContext,
                     ragSnippetCount,
                     session
             );
             session.appendAnswer(roundResult.answer());
+            emitAnswerTokens(session, roundResult.answer());
             Long assistantMessageId = conversationService.saveAssistantMessage(
                     session.conversationId(),
                     session.requestId(),
@@ -428,6 +426,7 @@ public class ChatGenerationService {
                     "stop",
                     null
             );
+            applyChatMemoryUpdate(chatContext, roundResult);
 
             sessionStore.appendEvent(
                     session,
@@ -477,7 +476,7 @@ public class ChatGenerationService {
             ChatSendRequest request,
             String requestId,
             Long userMessageId,
-            List<ChatMessage> contextMessages,
+            ChatContextAssembler.ChatContextSnapshot chatContext,
             int ragSnippetCount,
             ChatStreamSession session
     ) {
@@ -505,11 +504,14 @@ public class ChatGenerationService {
                         session
                 );
 
-                ChatResponse response = chatModel.chat(contextMessages);
-                return new ChatRoundResult(resolveAnswerText(response.aiMessage()), false);
+                ChatResponse response = chatModel.chat(chatContext.requestMessages());
+                AiMessage aiMessage = response.aiMessage();
+                return new ChatRoundResult(resolveAnswerText(aiMessage), false, aiMessage, null);
             }
 
-            List<ChatMessage> messages = new ArrayList<>(contextMessages);
+            List<ChatMessage> messages = new ArrayList<>(chatContext.requestMessages());
+            List<ChatMessage> turnMessages = new ArrayList<>();
+            turnMessages.add(chatContext.userMessage());
             boolean usedTools = false;
 
             for (int round = 1; round <= MAX_AGENT_TOOL_ROUNDS; round++) {
@@ -530,7 +532,8 @@ public class ChatGenerationService {
                 if (aiMessage != null && aiMessage.hasToolExecutionRequests()) {
                     usedTools = true;
                     messages.add(aiMessage);
-                    messages.addAll(executeToolRequests(
+                    turnMessages.add(aiMessage);
+                    List<ToolExecutionResultMessage> toolResults = executeToolRequests(
                             toolRuntime,
                             aiMessage.toolExecutionRequests(),
                             conversation,
@@ -538,11 +541,18 @@ public class ChatGenerationService {
                             userMessageId,
                             round,
                             session
-                    ));
+                    );
+                    messages.addAll(toolResults);
+                    turnMessages.addAll(toolResults);
                     continue;
                 }
 
-                return new ChatRoundResult(resolveAnswerText(aiMessage), usedTools);
+                return new ChatRoundResult(
+                        resolveAnswerText(aiMessage),
+                        usedTools,
+                        aiMessage,
+                        usedTools ? buildFinalMemoryMessages(chatContext, turnMessages, aiMessage) : null
+                );
             }
         }
 
@@ -768,6 +778,61 @@ public class ChatGenerationService {
         return result.result() == null ? "" : String.valueOf(result.result());
     }
 
+    /**
+     * 只要最终答案已经开始向前端输出，就不应再继续发 THINKING。
+     * 这里统一负责把“首个正文片段已开始输出”这个状态打到 session 上，
+     * 同时补一条 FINAL_RESPONSE_STREAMING trace。
+     */
+    private void markResponseStreamingStarted(ChatStreamSession session) {
+        if (session.markTraceStreamingStarted()) {
+            appendTrace(
+                    session,
+                    "FINAL_RESPONSE_STREAMING",
+                    "STREAM",
+                    session.userMessageId(),
+                    tracePayload("status", "FIRST_TOKEN"),
+                    true,
+                    null
+            );
+        }
+    }
+
+    /**
+     * Agent 路径当前仍是同步 tool loop，部分模型/网关也可能只在 onCompleteResponse 才返回正文。
+     * 为了避免 SSE 长时间只有 THINKING 没有正文，这里在“没有真实 partial token”时，
+     * 用最终答案做一层后端补偿式 token 拆分，让前端仍然按 token/message_end 统一渲染。
+     */
+    private void emitAnswerTokens(ChatStreamSession session, String answer) {
+        if (answer == null || answer.isBlank() || session.isResponseStreamingStarted()) {
+            return;
+        }
+
+        markResponseStreamingStarted(session);
+        for (String chunk : splitIntoStreamingChunks(answer)) {
+            sessionStore.appendEvent(session, "token", new ChatStreamTokenVO(session.requestId(), chunk));
+            try {
+                Thread.sleep(FALLBACK_STREAM_DELAY_MILLIS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private List<String> splitIntoStreamingChunks(String answer) {
+        int codePointCount = answer.codePointCount(0, answer.length());
+        List<String> chunks = new ArrayList<>();
+        for (int index = 0; index < codePointCount; index += FALLBACK_STREAM_CHUNK_CODE_POINTS) {
+            int beginIndex = answer.offsetByCodePoints(0, index);
+            int endIndex = answer.offsetByCodePoints(
+                    0,
+                    Math.min(codePointCount, index + FALLBACK_STREAM_CHUNK_CODE_POINTS)
+            );
+            chunks.add(answer.substring(beginIndex, endIndex));
+        }
+        return chunks;
+    }
+
     private TraceEventVO appendTrace(
             ChatStreamSession session,
             String eventType,
@@ -953,9 +1018,54 @@ public class ChatGenerationService {
         return throwable.getMessage();
     }
 
+    /**
+     * memory 只在本轮成功完成后回写。
+     * 这样可以保证失败请求不会把“只有 user、没有 assistant”的半轮对话污染到后续上下文里。
+     */
+    private void applyChatMemoryUpdate(
+            ChatContextAssembler.ChatContextSnapshot chatContext,
+            ChatRoundResult roundResult
+    ) {
+        if (chatContext == null || chatContext.chatMemory() == null || roundResult == null) {
+            return;
+        }
+
+        if (roundResult.finalMemoryMessages() != null) {
+            chatContext.chatMemory().set(roundResult.finalMemoryMessages());
+            return;
+        }
+
+        chatContext.chatMemory().add(chatContext.userMessage());
+        chatContext.chatMemory().add(resolveAssistantMessage(roundResult.aiMessage(), roundResult.answer()));
+    }
+
+    private List<ChatMessage> buildFinalMemoryMessages(
+            ChatContextAssembler.ChatContextSnapshot chatContext,
+            List<ChatMessage> turnMessages,
+            AiMessage finalAiMessage
+    ) {
+        if (chatContext == null || chatContext.chatMemory() == null) {
+            return null;
+        }
+
+        List<ChatMessage> finalMessages = new ArrayList<>(chatContext.baseMemoryMessages());
+        finalMessages.addAll(turnMessages);
+        finalMessages.add(resolveAssistantMessage(finalAiMessage, resolveAnswerText(finalAiMessage)));
+        return finalMessages;
+    }
+
+    private AiMessage resolveAssistantMessage(AiMessage aiMessage, String fallbackAnswer) {
+        if (aiMessage != null) {
+            return aiMessage;
+        }
+        return AiMessage.from(fallbackAnswer == null ? "" : fallbackAnswer);
+    }
+
     private record ChatRoundResult(
             String answer,
-            boolean usedTools
+            boolean usedTools,
+            AiMessage aiMessage,
+            List<ChatMessage> finalMemoryMessages
     ) {
     }
 

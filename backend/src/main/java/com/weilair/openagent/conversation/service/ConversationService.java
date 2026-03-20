@@ -3,6 +3,7 @@ package com.weilair.openagent.conversation.service;
 import java.time.LocalDateTime;
 import java.util.List;
 
+import com.weilair.openagent.ai.config.OpenAgentMemoryProperties;
 import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.conversation.exception.ConversationNotFoundException;
 import com.weilair.openagent.conversation.model.ConversationDO;
@@ -11,6 +12,7 @@ import com.weilair.openagent.conversation.persistence.mapper.ConversationMapper;
 import com.weilair.openagent.conversation.persistence.mapper.ConversationMessageMapper;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.dto.ConversationCreateRequest;
+import com.weilair.openagent.web.dto.ConversationSettingsUpdateRequest;
 import com.weilair.openagent.web.vo.ConversationMessageVO;
 import com.weilair.openagent.web.vo.ConversationVO;
 import org.springframework.stereotype.Service;
@@ -25,13 +27,16 @@ public class ConversationService {
     private static final int DEFAULT_MESSAGE_LIMIT = 200;
     private static final int DEFAULT_CONTEXT_TURN_LIMIT = 5;
 
+    private final OpenAgentMemoryProperties memoryProperties;
     private final ConversationMapper conversationMapper;
     private final ConversationMessageMapper conversationMessageMapper;
 
     public ConversationService(
+            OpenAgentMemoryProperties memoryProperties,
             ConversationMapper conversationMapper,
             ConversationMessageMapper conversationMessageMapper
     ) {
+        this.memoryProperties = memoryProperties;
         this.conversationMapper = conversationMapper;
         this.conversationMessageMapper = conversationMessageMapper;
     }
@@ -46,7 +51,7 @@ public class ConversationService {
         conversation.setTitle(resolveTitle(request.title(), "新会话"));
         conversation.setEnableRag(Boolean.TRUE.equals(request.enableRag()));
         conversation.setEnableAgent(Boolean.TRUE.equals(request.enableAgent()));
-        conversation.setMemoryEnabled(Boolean.TRUE);
+        conversation.setMemoryEnabled(Boolean.TRUE.equals(memoryProperties.getDefaultEnabled()));
         conversation.setModeCode(resolveModeCode(conversation.getEnableRag(), conversation.getEnableAgent()));
         conversation.setStatus(1);
         conversationMapper.insert(conversation);
@@ -67,7 +72,7 @@ public class ConversationService {
         conversation.setTitle(resolveTitle(null, request.message()));
         conversation.setEnableRag(Boolean.TRUE.equals(request.enableRag()));
         conversation.setEnableAgent(Boolean.TRUE.equals(request.enableAgent()));
-        conversation.setMemoryEnabled(Boolean.TRUE);
+        conversation.setMemoryEnabled(Boolean.TRUE.equals(memoryProperties.getDefaultEnabled()));
         conversation.setModeCode(resolveModeCode(conversation.getEnableRag(), conversation.getEnableAgent()));
         conversation.setStatus(1);
         conversationMapper.insert(conversation);
@@ -93,6 +98,26 @@ public class ConversationService {
         return conversationMessageMapper.selectByConversationId(conversationId, DEFAULT_MESSAGE_LIMIT).stream()
                 .map(this::toConversationMessageVO)
                 .toList();
+    }
+
+    /**
+     * 当前会话 settings 先只开放模式开关更新。
+     * 前端切换 RAG / Agent 后需要把持久配置同步回 conversation，
+     * 否则请求结束后重新拉取会话列表时会被旧值覆盖。
+     */
+    @Transactional
+    public ConversationVO updateSettings(Long conversationId, ConversationSettingsUpdateRequest request) {
+        ConversationDO conversation = requireConversation(conversationId);
+        Boolean enableRag = request.enableRag() != null ? request.enableRag() : conversation.getEnableRag();
+        Boolean enableAgent = request.enableAgent() != null ? request.enableAgent() : conversation.getEnableAgent();
+
+        conversationMapper.updateSettings(
+                conversationId,
+                enableRag,
+                enableAgent,
+                resolveModeCode(enableRag, enableAgent)
+        );
+        return toConversationVO(requireConversation(conversationId));
     }
 
     /**

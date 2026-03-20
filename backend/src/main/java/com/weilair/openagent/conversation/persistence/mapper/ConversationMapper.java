@@ -87,4 +87,20 @@ public interface ConversationMapper {
             @Param("conversationId") Long conversationId,
             @Param("lastMessageAt") LocalDateTime lastMessageAt
     );
+
+    @Update("""
+            UPDATE conversation
+            SET enable_rag = #{enableRag},
+                enable_agent = #{enableAgent},
+                mode_code = #{modeCode},
+                updated_at = CURRENT_TIMESTAMP(3)
+            WHERE id = #{conversationId}
+              AND status = 1
+            """)
+    int updateSettings(
+            @Param("conversationId") Long conversationId,
+            @Param("enableRag") Boolean enableRag,
+            @Param("enableAgent") Boolean enableAgent,
+            @Param("modeCode") String modeCode
+    );
 }

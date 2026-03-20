@@ -18,6 +18,11 @@ export interface ConversationCreateRequest {
   enableAgent?: boolean
 }
 
+export interface ConversationSettingsUpdateRequest {
+  enableRag?: boolean
+  enableAgent?: boolean
+}
+
 export interface ConversationMessage {
   id: number
   conversationId: number
@@ -53,5 +58,16 @@ export async function listConversationMessages(
   const response = await request<ConversationMessage[]>(
     `/api/v1/conversations/${conversationId}/messages`,
   )
+  return response.data
+}
+
+export async function updateConversationSettings(
+  conversationId: number,
+  requestBody: ConversationSettingsUpdateRequest,
+): Promise<Conversation> {
+  const response = await request<Conversation>(`/api/v1/conversations/${conversationId}/settings`, {
+    method: 'PUT',
+    body: JSON.stringify(requestBody),
+  })
   return response.data
 }

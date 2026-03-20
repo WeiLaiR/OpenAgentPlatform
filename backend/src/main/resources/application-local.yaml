@@ -25,6 +25,7 @@ openagent:
       base-url: http://192.1.1.4:8586/v1
       api-key: demo
       model-name: Qwen3.5-35B-A3B
+      tokenizer-model-name: gpt-3.5-turbo
     embedding:
       base-url: http://192.1.1.244:5000/v1
       api-key: demo

@@ -15,6 +15,12 @@ public class OpenAgentChatProperties {
     private String baseUrl;
     private String apiKey;
     private String modelName;
+    /**
+     * LangChain4j 1.12.1 当前没有“任意模型通用”的官方 TokenCountEstimator。
+     * 因此这里允许为 ChatMemory 单独指定一个官方 tokenizer 参考模型名，
+     * 例如聊天实际使用 Qwen，但 tokenizer 参考名配置为 gpt-3.5-turbo。
+     */
+    private String tokenizerModelName;
     private Double temperature = 0.2;
     private Duration timeout = Duration.ofMinutes(2);
     private Boolean logRequests = false;
@@ -42,6 +48,14 @@ public class OpenAgentChatProperties {
 
     public void setModelName(String modelName) {
         this.modelName = modelName;
+    }
+
+    public String getTokenizerModelName() {
+        return tokenizerModelName;
+    }
+
+    public void setTokenizerModelName(String tokenizerModelName) {
+        this.tokenizerModelName = tokenizerModelName;
     }
 
     public Double getTemperature() {

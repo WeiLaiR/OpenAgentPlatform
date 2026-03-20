@@ -7,6 +7,7 @@ import {
   listConversations,
   type Conversation,
   type ConversationMessage,
+  updateConversationSettings,
 } from '@/api/conversation'
 import {
   submitChat,
@@ -188,6 +189,7 @@ async function handleSendSync() {
   traceError.value = ''
 
   try {
+    await persistActiveConversationSettings()
     const answer = await sendChatSync(buildChatRequest(message))
     activeChatRequestId.value = answer.requestId ?? ''
     chatInput.value = ''
@@ -208,41 +210,45 @@ async function handleSend() {
   chatLoading.value = true
   chatError.value = ''
   traceError.value = ''
-  traces.value = []
-  closeStreams()
-
-  const optimisticUserMessageId = -Date.now()
-  const optimisticAssistantMessageId = -(Date.now() + 1)
-  const currentConversationId = activeConversationId.value ?? 0
-
-  messages.value = [
-    ...messages.value,
-    {
-      id: optimisticUserMessageId,
-      conversationId: currentConversationId,
-      roleCode: 'USER',
-      messageType: 'TEXT',
-      content: message,
-      requestId: null,
-      finishReason: null,
-      createdAt: Date.now(),
-    },
-    {
-      id: optimisticAssistantMessageId,
-      conversationId: currentConversationId,
-      roleCode: 'ASSISTANT',
-      messageType: 'TEXT',
-      content: '',
-      requestId: null,
-      finishReason: null,
-      createdAt: Date.now(),
-      uiState: 'thinking',
-      thinkingStartedAt: Date.now(),
-      progressMessage: '模型正在思考，请稍候…',
-    },
-  ]
+  let optimisticUserMessageId: number | null = null
+  let optimisticAssistantMessageId: number | null = null
 
   try {
+    await persistActiveConversationSettings()
+    traces.value = []
+    closeStreams()
+
+    optimisticUserMessageId = -Date.now()
+    optimisticAssistantMessageId = -(Date.now() + 1)
+    const currentConversationId = activeConversationId.value ?? 0
+
+    messages.value = [
+      ...messages.value,
+      {
+        id: optimisticUserMessageId,
+        conversationId: currentConversationId,
+        roleCode: 'USER',
+        messageType: 'TEXT',
+        content: message,
+        requestId: null,
+        finishReason: null,
+        createdAt: Date.now(),
+      },
+      {
+        id: optimisticAssistantMessageId,
+        conversationId: currentConversationId,
+        roleCode: 'ASSISTANT',
+        messageType: 'TEXT',
+        content: '',
+        requestId: null,
+        finishReason: null,
+        createdAt: Date.now(),
+        uiState: 'thinking',
+        thinkingStartedAt: Date.now(),
+        progressMessage: '模型正在思考，请稍候…',
+      },
+    ]
+
     const accepted = await submitChat(buildChatRequest(message))
     activeChatRequestId.value = accepted.requestId
     if (accepted.conversationId) {
@@ -257,7 +263,11 @@ async function handleSend() {
     await chatStreamPromise
     await refreshAfterRound(accepted.conversationId, accepted.requestId)
   } catch (error) {
-    removeOptimisticMessages([optimisticUserMessageId, optimisticAssistantMessageId])
+    removeOptimisticMessages(
+      [optimisticUserMessageId, optimisticAssistantMessageId].filter(
+        (messageId): messageId is number => messageId !== null,
+      ),
+    )
     chatError.value = error instanceof RequestError ? error.message : '聊天请求提交失败。'
   } finally {
     chatLoading.value = false
@@ -360,6 +370,7 @@ function appendAssistantChunk(assistantMessageId: number, streamRequestId: strin
     existing.requestId = streamRequestId
     existing.content = `${existing.content ?? ''}${content}`
     existing.uiState = 'streaming'
+    existing.progressMessage = undefined
     return
   }
 
@@ -386,6 +397,7 @@ function completeAssistantMessage(assistantMessageId: number, streamRequestId: s
     target.content = answer
     target.finishReason = 'stop'
     target.uiState = 'done'
+    target.progressMessage = undefined
   }
 }
 
@@ -407,11 +419,51 @@ function updateAssistantProgress(
   if (!target) {
     return
   }
+  if (target.content || target.uiState === 'streaming' || target.uiState === 'done') {
+    return
+  }
   target.requestId = streamRequestId
   target.uiState = 'thinking'
   target.progressMessage = payload.message
   if (!target.thinkingStartedAt) {
     target.thinkingStartedAt = Date.now() - payload.elapsedMillis
+  }
+}
+
+function updateConversationCache(conversation: Conversation) {
+  conversations.value = conversations.value.map((item) =>
+    item.id === conversation.id ? conversation : item,
+  )
+}
+
+async function persistActiveConversationSettings() {
+  const conversationId = activeConversationId.value
+  if (!conversationId) {
+    return null
+  }
+
+  const currentConversation = conversations.value.find((item) => item.id === conversationId)
+  if (
+    currentConversation &&
+    currentConversation.enableRag === modeState.value.enableRag &&
+    currentConversation.enableAgent === modeState.value.enableAgent
+  ) {
+    return currentConversation
+  }
+
+  const updatedConversation = await updateConversationSettings(conversationId, {
+    enableRag: modeState.value.enableRag,
+    enableAgent: modeState.value.enableAgent,
+  })
+  updateConversationCache(updatedConversation)
+  return updatedConversation
+}
+
+async function handleModeChange() {
+  try {
+    await persistActiveConversationSettings()
+  } catch (error) {
+    chatError.value = error instanceof RequestError ? error.message : '会话模式保存失败。'
   }
 }
 
@@ -849,8 +901,8 @@ onBeforeUnmount(() => {
       </template>
 
       <div class="chat-toolbar">
-        <el-switch v-model="modeState.enableRag" active-text="RAG" />
-        <el-switch v-model="modeState.enableAgent" active-text="Agent" />
+        <el-switch v-model="modeState.enableRag" active-text="RAG" @change="handleModeChange" />
+        <el-switch v-model="modeState.enableAgent" active-text="Agent" @change="handleModeChange" />
       </div>
       <p class="mode-hint">
         Agent 模式当前会优先挂载“已启用且健康”的 MCP Server 工具；如果没有可用工具，本轮会自动退化为普通模型回答。
