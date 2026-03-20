@@ -26,24 +26,31 @@ public class ChatContextAssembler {
      * 这里正式切到 LangChain4j ChatMemory 作为“模型上下文视图”：
      * 1. history 继续留在 conversation_message，供前端重放和审计使用
      * 2. memory 只负责本轮真正发给模型的上下文窗口
-     * 3. 当前轮 user message 与 RAG 片段先只进入 request messages，成功后再回写 memory
+     * 3. `userMessage` 表示“原始用户输入”，`requestUserMessage` 表示“真正发给模型的当前轮输入”
+     * 4. 当 RAG 切到 `RetrievalAugmentor` 后，增强后的内容只进入 `requestUserMessage`，不直接回写 memory
      *
      * 这样做的原因是：如果模型调用失败，不应把“未完成的一轮”提前污染 ChatMemory。
      */
     public ChatContextSnapshot assemble(
             ConversationDO conversation,
+            ChatExecutionSpec executionSpec,
             String currentUserMessage,
             List<RagSnippetVO> ragSnippets
     ) {
         ChatMemory chatMemory = null;
         List<ChatMessage> baseMemoryMessages = List.of();
 
-        if (Boolean.TRUE.equals(conversation.getMemoryEnabled())) {
+        boolean memoryEnabled = executionSpec != null
+                ? executionSpec.memoryEnabled()
+                : Boolean.TRUE.equals(conversation.getMemoryEnabled());
+
+        if (memoryEnabled) {
             chatMemory = conversationMemoryService.getOrCreateMemory(conversation.getId());
             baseMemoryMessages = List.copyOf(chatMemory.messages());
         }
 
         UserMessage userMessage = UserMessage.from(currentUserMessage);
+        UserMessage requestUserMessage = userMessage;
         List<ChatMessage> requestMessages = new ArrayList<>(baseMemoryMessages);
 
         SystemMessage transientRagMessage = null;
@@ -52,14 +59,27 @@ public class ChatContextAssembler {
             requestMessages.add(transientRagMessage);
         }
 
-        requestMessages.add(userMessage);
+        requestMessages.add(requestUserMessage);
         return new ChatContextSnapshot(
                 chatMemory,
                 baseMemoryMessages,
                 userMessage,
+                requestUserMessage,
                 transientRagMessage,
                 List.copyOf(requestMessages)
         );
+    }
+
+    /**
+     * 兼容当前仍以 conversation 持久配置为唯一 memory 开关来源的调用方式。
+     * 等统一编排骨架全面切到 `ChatExecutionSpec` 后，这个重载可以再视情况收敛。
+     */
+    public ChatContextSnapshot assemble(
+            ConversationDO conversation,
+            String currentUserMessage,
+            List<RagSnippetVO> ragSnippets
+    ) {
+        return assemble(conversation, null, currentUserMessage, ragSnippets);
     }
 
     private String buildRagContextMessage(List<RagSnippetVO> ragSnippets) {
@@ -88,8 +108,25 @@ public class ChatContextAssembler {
             ChatMemory chatMemory,
             List<ChatMessage> baseMemoryMessages,
             UserMessage userMessage,
+            UserMessage requestUserMessage,
             SystemMessage transientRagMessage,
             List<ChatMessage> requestMessages
     ) {
+
+        public ChatContextSnapshot withRequestUserMessage(UserMessage requestUserMessage) {
+            List<ChatMessage> rebuiltRequestMessages = new ArrayList<>(baseMemoryMessages);
+            if (transientRagMessage != null) {
+                rebuiltRequestMessages.add(transientRagMessage);
+            }
+            rebuiltRequestMessages.add(requestUserMessage);
+            return new ChatContextSnapshot(
+                    chatMemory,
+                    baseMemoryMessages,
+                    userMessage,
+                    requestUserMessage,
+                    transientRagMessage,
+                    List.copyOf(rebuiltRequestMessages)
+            );
+        }
     }
 }

@@ -60,6 +60,15 @@ public class KnowledgeEmbeddingService {
         return embeddingModel;
     }
 
+    /**
+     * RAG 底座已经回切到官方 `EmbeddingStoreContentRetriever`，
+     * 因此这里额外暴露当前统一装配的 `EmbeddingModel`，
+     * 让检索增强链路和文件索引链路继续共用同一套模型来源与错误提示。
+     */
+    public EmbeddingModel currentEmbeddingModel() {
+        return requireEmbeddingModel();
+    }
+
     private RuntimeException wrapEmbeddingException(RuntimeException exception) {
         String message = safeMessage(exception);
         if (message.contains("404") && message.toUpperCase().contains("NOT FOUND")) {

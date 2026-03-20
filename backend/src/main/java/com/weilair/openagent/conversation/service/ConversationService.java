@@ -4,6 +4,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 import com.weilair.openagent.ai.config.OpenAgentMemoryProperties;
+import com.weilair.openagent.chat.model.ChatMode;
 import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.conversation.exception.ConversationNotFoundException;
 import com.weilair.openagent.conversation.model.ConversationDO;
@@ -216,18 +217,7 @@ public class ConversationService {
     }
 
     private String resolveModeCode(Boolean enableRag, Boolean enableAgent) {
-        boolean ragEnabled = Boolean.TRUE.equals(enableRag);
-        boolean agentEnabled = Boolean.TRUE.equals(enableAgent);
-        if (ragEnabled && agentEnabled) {
-            return "RAG_AGENT";
-        }
-        if (ragEnabled) {
-            return "RAG";
-        }
-        if (agentEnabled) {
-            return "AGENT";
-        }
-        return "CHAT";
+        return ChatMode.fromFlags(enableRag, enableAgent).code();
     }
 
     private String resolveStatusLabel(Integer status) {

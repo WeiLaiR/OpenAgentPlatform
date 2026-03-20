@@ -84,7 +84,14 @@ public class ChatStreamSession {
     }
 
     public void appendAnswer(String content) {
-        this.answerBuilder.append(content);
+        if (content != null) {
+            this.answerBuilder.append(content);
+        }
+    }
+
+    public void replaceAnswer(String content) {
+        this.answerBuilder.setLength(0);
+        this.answerBuilder.append(content == null ? "" : content);
     }
 
     public String answer() {

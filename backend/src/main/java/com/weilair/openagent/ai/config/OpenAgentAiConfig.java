@@ -1,15 +1,18 @@
 package com.weilair.openagent.ai.config;
 
 import java.net.URI;
+import java.util.List;
 
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import dev.langchain4j.model.chat.listener.ChatModelListener;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.util.StringUtils;
@@ -41,7 +44,10 @@ public class OpenAgentAiConfig {
     @ConditionalOnExpression(
             "'${openagent.ai.chat.base-url:}' != '' and '${openagent.ai.chat.model-name:}' != ''"
     )
-    public ChatModel chatModel(OpenAgentChatProperties properties) {
+    public ChatModel chatModel(
+            OpenAgentChatProperties properties,
+            ObjectProvider<ChatModelListener> chatModelListenersProvider
+    ) {
         // ChatModel 对应“同步一次性返回完整答案”的调用方式。
         return OpenAiChatModel.builder()
                 .baseUrl(normalizeOpenAiCompatibleBaseUrl(properties.getBaseUrl()))
@@ -51,6 +57,7 @@ public class OpenAgentAiConfig {
                 .timeout(properties.getTimeout())
                 .logRequests(Boolean.TRUE.equals(properties.getLogRequests()))
                 .logResponses(Boolean.TRUE.equals(properties.getLogResponses()))
+                .listeners(resolveChatModelListeners(chatModelListenersProvider))
                 .build();
     }
 
@@ -58,7 +65,10 @@ public class OpenAgentAiConfig {
     @ConditionalOnExpression(
             "'${openagent.ai.chat.base-url:}' != '' and '${openagent.ai.chat.model-name:}' != ''"
     )
-    public StreamingChatModel streamingChatModel(OpenAgentChatProperties properties) {
+    public StreamingChatModel streamingChatModel(
+            OpenAgentChatProperties properties,
+            ObjectProvider<ChatModelListener> chatModelListenersProvider
+    ) {
         // StreamingChatModel 对应“边生成边回调 token”的调用方式，后端会把它再映射成 SSE。
         return OpenAiStreamingChatModel.builder()
                 .baseUrl(normalizeOpenAiCompatibleBaseUrl(properties.getBaseUrl()))
@@ -68,6 +78,7 @@ public class OpenAgentAiConfig {
                 .timeout(properties.getTimeout())
                 .logRequests(Boolean.TRUE.equals(properties.getLogRequests()))
                 .logResponses(Boolean.TRUE.equals(properties.getLogResponses()))
+                .listeners(resolveChatModelListeners(chatModelListenersProvider))
                 .build();
     }
 
@@ -137,5 +148,17 @@ public class OpenAgentAiConfig {
         }
 
         return normalized;
+    }
+
+    private List<ChatModelListener> resolveChatModelListeners(
+            ObjectProvider<ChatModelListener> chatModelListenersProvider
+    ) {
+        /**
+         * 这里显式把 Spring Bean 形式存在的 `ChatModelListener` 挂回模型 builder。
+         *
+         * 这样后续继续补更多 LangChain4j 原生 observability listener 时，
+         * 不需要再改 ChatModel/StreamingChatModel 的装配代码。
+         */
+        return chatModelListenersProvider.orderedStream().toList();
     }
 }

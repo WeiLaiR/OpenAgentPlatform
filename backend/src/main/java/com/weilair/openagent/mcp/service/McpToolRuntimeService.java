@@ -10,6 +10,7 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.mcp.McpToolProvider;
 import dev.langchain4j.mcp.client.McpClient;
 import dev.langchain4j.service.tool.ToolExecutor;
+import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import com.weilair.openagent.mcp.model.McpServerDO;
@@ -164,6 +165,18 @@ public class McpToolRuntimeService {
 
         public ToolExecutor toolExecutor(String toolName) {
             return toolProviderResult.toolExecutorByName(toolName);
+        }
+
+        /**
+         * 这里把已经解析完成的 `ToolProviderResult` 再包一层 `ToolProvider` 暴露出去，
+         * 目的是让上层可以直接接入 AI Services 官方 `toolProvider(...)` 主线。
+         *
+         * 当前实现仍然是“先按平台配置装配一次工具快照，再在本轮会话里复用这份结果”，
+         * 还不是最终的“会话级 server 绑定 + 请求级动态筛选”形态；
+         * 但它已经把工具调用重新收口回 LangChain4j 官方 `ToolProvider` 抽象。
+         */
+        public ToolProvider toolProvider() {
+            return request -> toolProviderResult;
         }
 
         @Override
