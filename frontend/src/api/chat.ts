@@ -5,7 +5,9 @@ export interface ChatSendRequest {
   message: string
   enableRag: boolean
   enableAgent: boolean
+  memoryEnabled?: boolean
   knowledgeBaseIds?: number[]
+  mcpServerIds?: number[]
 }
 
 export interface ChatRequestAccepted {

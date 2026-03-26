@@ -6,6 +6,9 @@ export interface Conversation {
   modeCode: string
   enableRag: boolean
   enableAgent: boolean
+  memoryEnabled: boolean
+  knowledgeBaseIds: number[]
+  mcpServerIds: number[]
   status: string
   lastMessageAt: number | null
   createdAt: number
@@ -21,6 +24,14 @@ export interface ConversationCreateRequest {
 export interface ConversationSettingsUpdateRequest {
   enableRag?: boolean
   enableAgent?: boolean
+  memoryEnabled?: boolean
+  knowledgeBaseIds?: number[]
+  mcpServerIds?: number[]
+}
+
+export interface ConversationMemoryClearResult {
+  conversationId: number
+  cleared: boolean
 }
 
 export interface ConversationMessage {
@@ -69,5 +80,22 @@ export async function updateConversationSettings(
     method: 'PUT',
     body: JSON.stringify(requestBody),
   })
+  return response.data
+}
+
+export async function getConversationSettings(conversationId: number): Promise<Conversation> {
+  const response = await request<Conversation>(`/api/v1/conversations/${conversationId}/settings`)
+  return response.data
+}
+
+export async function clearConversationMemory(
+  conversationId: number,
+): Promise<ConversationMemoryClearResult> {
+  const response = await request<ConversationMemoryClearResult>(
+    `/api/v1/conversations/${conversationId}/memory/clear`,
+    {
+      method: 'POST',
+    },
+  )
   return response.data
 }

@@ -115,7 +115,8 @@ public class ChatOrchestrator {
      */
     public ChatAnswerVO sendSync(ChatSendRequest request) {
         ConversationDO conversation = conversationService.resolveConversation(request);
-        ChatExecutionSpec executionSpec = modeResolver.resolve(conversation, request, false);
+        var settingsSnapshot = conversationService.resolveSettingsSnapshot(conversation);
+        ChatExecutionSpec executionSpec = modeResolver.resolve(settingsSnapshot, request, false);
         String requestId = RequestIdContext.getRequestId();
         ChatOutputPort outputPort = new BufferedChatOutputPort(requestId, conversation.getId());
         executionGuard.acquire(conversation.getId(), requestId);
@@ -133,6 +134,7 @@ public class ChatOrchestrator {
                     true,
                     null
             );
+            traceResolvedExecutionSpec(outputPort, request, executionSpec);
             ChatAnswerResult answerResult;
             if (executionSpec.agentEnabled()) {
                 ChatModel chatModel = requireChatModel();
@@ -202,7 +204,8 @@ public class ChatOrchestrator {
      */
     public ChatRequestAcceptedVO submit(ChatSendRequest request) {
         ConversationDO conversation = conversationService.resolveConversation(request);
-        ChatExecutionSpec executionSpec = modeResolver.resolve(conversation, request, true);
+        var settingsSnapshot = conversationService.resolveSettingsSnapshot(conversation);
+        ChatExecutionSpec executionSpec = modeResolver.resolve(settingsSnapshot, request, true);
         ChatStreamSession session = sessionStore.create(conversation.getId());
         ChatOutputPort outputPort = new StreamingChatOutputPort(sessionStore, session);
         executionGuard.acquire(conversation.getId(), outputPort.requestId());
@@ -220,6 +223,7 @@ public class ChatOrchestrator {
                     true,
                     null
             );
+            traceResolvedExecutionSpec(outputPort, request, executionSpec);
             executorService.submit(() -> emitThinkingProgress(outputPort));
             if (executionSpec.agentEnabled()) {
                 StreamingChatModel streamingChatModel = requireStreamingChatModel();
@@ -690,8 +694,8 @@ public class ChatOrchestrator {
          * Tool runtime 的职责是把“平台配置层的 MCP Server / Tool 快照”
          * 转成“当前这一轮聊天真正可挂到模型上的 Tool 集合”。
          *
-         * 当前策略先按“所有已启用且健康的工具都可用”处理；
-         * 会话级绑定 `conversation_mcp_binding` 留到下一阶段再接入。
+         * 当前已经统一按 `ChatExecutionSpec` 中的最终生效 MCP Server 集合装配，
+         * 这里不再自行解释会话级绑定或请求覆盖优先级。
          */
         ResolvedToolRuntime runtime = toolRuntimeResolver.openRuntime(conversation.getId(), executionSpec, request.message());
         if (!executionSpec.agentEnabled()) {
@@ -990,6 +994,37 @@ public class ChatOrchestrator {
                 "MODEL_REQUEST_STARTED",
                 "MODEL",
                 modelStartPayload(mode, ragEnabled ? -1 : 0, true, toolRuntime.toolCount(), 1),
+                true,
+                null
+        );
+    }
+
+    private void traceResolvedExecutionSpec(
+            ChatOutputPort outputPort,
+            ChatSendRequest request,
+            ChatExecutionSpec executionSpec
+    ) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("modeCode", executionSpec.modeCode());
+        payload.put("streaming", executionSpec.streaming());
+        payload.put("ragEnabled", executionSpec.ragEnabled());
+        payload.put("agentEnabled", executionSpec.agentEnabled());
+        payload.put("memoryEnabled", executionSpec.memoryEnabled());
+        payload.put("knowledgeBaseIds", executionSpec.knowledgeBaseIds());
+        payload.put("mcpServerIds", executionSpec.mcpServerIds());
+        payload.put("requestOverrides", Map.of(
+                "enableRag", request.enableRag() != null,
+                "enableAgent", request.enableAgent() != null,
+                "memoryEnabled", request.memoryEnabled() != null,
+                "knowledgeBaseIds", request.knowledgeBaseIds() != null,
+                "mcpServerIds", request.mcpServerIds() != null
+        ));
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                "CHAT_EXECUTION_SPEC_RESOLVED",
+                "CONFIG",
+                payload,
                 true,
                 null
         );

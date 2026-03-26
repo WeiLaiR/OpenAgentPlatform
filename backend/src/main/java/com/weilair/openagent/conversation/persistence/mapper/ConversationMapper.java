@@ -92,6 +92,7 @@ public interface ConversationMapper {
             UPDATE conversation
             SET enable_rag = #{enableRag},
                 enable_agent = #{enableAgent},
+                memory_enabled = #{memoryEnabled},
                 mode_code = #{modeCode},
                 updated_at = CURRENT_TIMESTAMP(3)
             WHERE id = #{conversationId}
@@ -101,6 +102,7 @@ public interface ConversationMapper {
             @Param("conversationId") Long conversationId,
             @Param("enableRag") Boolean enableRag,
             @Param("enableAgent") Boolean enableAgent,
+            @Param("memoryEnabled") Boolean memoryEnabled,
             @Param("modeCode") String modeCode
     );
 }

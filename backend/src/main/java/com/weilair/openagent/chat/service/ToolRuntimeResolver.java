@@ -28,7 +28,11 @@ public class ToolRuntimeResolver {
         }
 
         try {
-            McpToolRuntime runtime = mcpToolRuntimeService.openRuntime(conversationId, userMessage);
+            McpToolRuntime runtime = mcpToolRuntimeService.openRuntime(
+                    conversationId,
+                    userMessage,
+                    executionSpec.mcpServerIds()
+            );
             if (runtime.hasTools()) {
                 return ResolvedToolRuntime.available(runtime);
             }

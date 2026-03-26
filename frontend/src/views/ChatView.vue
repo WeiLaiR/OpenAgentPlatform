@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { MoreFilled, Plus, Setting } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
+  clearConversationMemory,
   createConversation,
+  getConversationSettings,
   listConversationMessages,
   listConversations,
   type Conversation,
@@ -20,7 +24,17 @@ import {
 } from '@/api/chat'
 import { RequestError } from '@/api/http'
 import { listKnowledgeBases, type KnowledgeBase } from '@/api/knowledge'
+import { listMcpServers, type McpServer } from '@/api/mcp'
 import { getTraceDetail, type TraceEvent } from '@/api/trace'
+
+const DEFAULT_MEMORY_ENABLED = true
+
+function createIdOverrideState() {
+  return {
+    enabled: false,
+    ids: [] as number[],
+  }
+}
 
 const chatInput = ref('')
 const chatLoading = ref(false)
@@ -29,6 +43,7 @@ const activeChatRequestId = ref('')
 const modeState = ref({
   enableRag: false,
   enableAgent: false,
+  memoryEnabled: DEFAULT_MEMORY_ENABLED,
 })
 const conversations = ref<Conversation[]>([])
 const messages = ref<ConversationMessage[]>([])
@@ -40,16 +55,27 @@ const availableKnowledgeBases = ref<KnowledgeBase[]>([])
 const knowledgeLoading = ref(false)
 const knowledgeError = ref('')
 const selectedKnowledgeBaseIds = ref<number[]>([])
+const availableMcpServers = ref<McpServer[]>([])
+const mcpLoading = ref(false)
+const mcpError = ref('')
+const selectedMcpServerIds = ref<number[]>([])
+const requestKnowledgeBaseOverride = ref(createIdOverrideState())
+const requestMcpServerOverride = ref(createIdOverrideState())
+const memoryClearing = ref(false)
 const traceFilter = ref<'ALL' | 'RAG' | 'MODEL' | 'TOOL' | 'FAILED'>('ALL')
 const traceExpandedIds = ref<number[]>([])
+const settingsDrawerVisible = ref(false)
+const traceDialogVisible = ref(false)
+const traceDialogLoading = ref(false)
+const chatHistoryRef = ref<HTMLElement | null>(null)
+const chatInputRef = ref<{ focus: () => void } | null>(null)
+const chatAutoScrollPinned = ref(true)
+const showScrollToLatest = ref(false)
 
 let activeChatSource: EventSource | null = null
 let activeTraceSource: EventSource | null = null
 let thinkingTicker: number | null = null
-
-const activeConversation = computed(() => {
-  return conversations.value.find((item) => item.id === activeConversationId.value) ?? null
-})
+let chatScrollFrame: number | null = null
 
 const selectedKnowledgeBases = computed(() => {
   return availableKnowledgeBases.value.filter((item) =>
@@ -57,8 +83,36 @@ const selectedKnowledgeBases = computed(() => {
   )
 })
 
+const selectedMcpServers = computed(() => {
+  return availableMcpServers.value.filter((item) =>
+    selectedMcpServerIds.value.includes(item.id),
+  )
+})
+
 const knowledgeBaseNameMap = computed(() => {
   return new Map(availableKnowledgeBases.value.map((item) => [item.id, item.name]))
+})
+
+const mcpServerNameMap = computed(() => {
+  return new Map(availableMcpServers.value.map((item) => [item.id, item.name]))
+})
+
+const effectiveKnowledgeBaseIds = computed(() => {
+  if (!modeState.value.enableRag) {
+    return []
+  }
+  return requestKnowledgeBaseOverride.value.enabled
+    ? requestKnowledgeBaseOverride.value.ids
+    : selectedKnowledgeBaseIds.value
+})
+
+const effectiveMcpServerIds = computed(() => {
+  if (!modeState.value.enableAgent) {
+    return []
+  }
+  return requestMcpServerOverride.value.enabled
+    ? requestMcpServerOverride.value.ids
+    : selectedMcpServerIds.value
 })
 
 const filteredTraces = computed(() => {
@@ -75,7 +129,7 @@ const currentRoundSummary = computed(() => {
   const knowledgeBaseIds =
     readTraceNumericArray(ragStarted, 'knowledgeBaseIds') ??
     readTraceNumericArray(ragFinished, 'knowledgeBaseIds') ??
-    (modeState.value.enableRag ? [...selectedKnowledgeBaseIds.value] : [])
+    (modeState.value.enableRag ? [...effectiveKnowledgeBaseIds.value] : [])
   const retrievedCount =
     readTraceNumber(ragSelected, 'count') ?? readTraceNumber(ragFinished, 'count') ?? 0
   const ragSnippetCount = readTraceNumber(modelStarted, 'ragSnippetCount') ?? retrievedCount
@@ -111,8 +165,32 @@ const currentRoundSummary = computed(() => {
   }
 })
 
+const activeModeLabel = computed(() => {
+  return formatModeLabel(modeState.value.enableRag, modeState.value.enableAgent)
+})
+
+const chatStarted = computed(() => messages.value.length > 0)
+
+const messageRenderSignature = computed(() => {
+  return messages.value
+    .map((item) => `${item.id}:${item.roleCode}:${item.content?.length ?? 0}:${item.uiState ?? 'done'}`)
+    .join('|')
+})
+
+const stageFactItems = computed(() => [
+  { label: activeModeLabel.value, value: modeState.value.memoryEnabled ? 'Memory 开启' : 'Memory 关闭' },
+  {
+    label: `${effectiveKnowledgeBaseIds.value.length} 个知识库`,
+    value: requestKnowledgeBaseOverride.value.enabled ? '本轮覆盖' : '会话默认',
+  },
+  {
+    label: `${effectiveMcpServerIds.value.length} 个 MCP`,
+    value: requestMcpServerOverride.value.enabled ? '本轮覆盖' : '会话默认',
+  },
+])
+
 async function loadConversations(preserveActive = true) {
-  const list = await listConversations()
+  const list = sortConversations(await listConversations())
   conversations.value = list
 
   if (preserveActive && activeConversationId.value) {
@@ -130,6 +208,14 @@ async function loadConversations(preserveActive = true) {
 
   activeConversationId.value = null
   messages.value = []
+  selectedKnowledgeBaseIds.value = []
+  selectedMcpServerIds.value = []
+  modeState.value = {
+    enableRag: false,
+    enableAgent: false,
+    memoryEnabled: DEFAULT_MEMORY_ENABLED,
+  }
+  resetRequestOverrides()
 }
 
 async function loadKnowledgeOptions() {
@@ -142,9 +228,13 @@ async function loadKnowledgeOptions() {
     selectedKnowledgeBaseIds.value = selectedKnowledgeBaseIds.value.filter((id) =>
       list.some((item) => item.id === id),
     )
+    requestKnowledgeBaseOverride.value.ids = requestKnowledgeBaseOverride.value.ids.filter((id) =>
+      list.some((item) => item.id === id),
+    )
   } catch (error) {
     availableKnowledgeBases.value = []
     selectedKnowledgeBaseIds.value = []
+    requestKnowledgeBaseOverride.value.ids = []
     knowledgeError.value =
       error instanceof RequestError ? error.message : '知识库列表加载失败，请稍后重试。'
   } finally {
@@ -152,14 +242,132 @@ async function loadKnowledgeOptions() {
   }
 }
 
+async function loadMcpServerOptions() {
+  mcpLoading.value = true
+  mcpError.value = ''
+
+  try {
+    const list = await listMcpServers({ limit: 100 })
+    availableMcpServers.value = list
+    selectedMcpServerIds.value = selectedMcpServerIds.value.filter((id) =>
+      list.some((item) => item.id === id),
+    )
+    requestMcpServerOverride.value.ids = requestMcpServerOverride.value.ids.filter((id) =>
+      list.some((item) => item.id === id),
+    )
+  } catch (error) {
+    availableMcpServers.value = []
+    selectedMcpServerIds.value = []
+    requestMcpServerOverride.value.ids = []
+    mcpError.value =
+      error instanceof RequestError ? error.message : 'MCP Server 列表加载失败，请稍后重试。'
+  } finally {
+    mcpLoading.value = false
+  }
+}
+
 async function createNewConversation() {
-  const conversation = await createConversation({
-    title: '新会话',
+  const draftSettings = {
     enableRag: modeState.value.enableRag,
     enableAgent: modeState.value.enableAgent,
+    memoryEnabled: modeState.value.memoryEnabled,
+    knowledgeBaseIds: [...selectedKnowledgeBaseIds.value],
+    mcpServerIds: [...selectedMcpServerIds.value],
+  }
+  const conversation = await createConversation({
+    title: '新会话',
+    enableRag: draftSettings.enableRag,
+    enableAgent: draftSettings.enableAgent,
   })
-  conversations.value = [conversation, ...conversations.value]
+  let persistedConversation = conversation
+  if (
+    draftSettings.memoryEnabled !== conversation.memoryEnabled ||
+    draftSettings.knowledgeBaseIds.length > 0 ||
+    draftSettings.mcpServerIds.length > 0
+  ) {
+    persistedConversation = await updateConversationSettings(conversation.id, draftSettings)
+  }
+  conversations.value = [persistedConversation, ...conversations.value]
+  await selectConversation(persistedConversation.id)
+}
+
+async function focusChatInput() {
+  await nextTick()
+  chatInputRef.value?.focus()
+}
+
+function isChatHistoryNearBottom() {
+  const element = chatHistoryRef.value
+  if (!element) {
+    return true
+  }
+
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 80
+}
+
+function syncChatHistoryScrollState() {
+  const pinned = isChatHistoryNearBottom()
+  chatAutoScrollPinned.value = pinned
+  showScrollToLatest.value = !pinned && messages.value.length > 0
+}
+
+function scrollChatHistoryToBottom(smooth = false) {
+  const element = chatHistoryRef.value
+  if (!element) {
+    return
+  }
+
+  if (chatScrollFrame !== null) {
+    window.cancelAnimationFrame(chatScrollFrame)
+  }
+
+  chatScrollFrame = window.requestAnimationFrame(() => {
+    element.scrollTo({
+      top: element.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto',
+    })
+    chatScrollFrame = null
+    window.requestAnimationFrame(() => syncChatHistoryScrollState())
+  })
+}
+
+function keepChatHistoryPinned(force = false) {
+  if (force || chatAutoScrollPinned.value) {
+    showScrollToLatest.value = false
+    scrollChatHistoryToBottom(force)
+    return
+  }
+
+  showScrollToLatest.value = true
+}
+
+function handleChatHistoryScroll() {
+  syncChatHistoryScrollState()
+}
+
+async function handleConversationCommand(command: string, conversation: Conversation) {
+  if (command === 'copy-id') {
+    try {
+      await navigator.clipboard.writeText(String(conversation.id))
+      ElMessage.success(`会话 #${conversation.id} 已复制。`)
+    } catch {
+      ElMessage.error('复制会话 ID 失败。')
+    }
+    return
+  }
+
   await selectConversation(conversation.id)
+
+  if (command === 'settings') {
+    settingsDrawerVisible.value = true
+  }
+}
+
+function handleConversationDropdownCommand(
+  conversation: Conversation,
+  command: string | number | Record<string, unknown>,
+) {
+  void handleConversationCommand(String(command), conversation)
 }
 
 async function selectConversation(conversationId: number) {
@@ -168,14 +376,53 @@ async function selectConversation(conversationId: number) {
   traces.value = []
   traceError.value = ''
   closeStreams()
+  resetRequestOverrides()
 
-  const conversation = conversations.value.find((item) => item.id === conversationId)
-  if (conversation) {
-    modeState.value.enableRag = conversation.enableRag
-    modeState.value.enableAgent = conversation.enableAgent
+  const [records, conversation] = await Promise.all([
+    listConversationMessages(conversationId),
+    getConversationSettings(conversationId),
+  ])
+  applyConversationSettings(conversation)
+  updateConversationCache(conversation)
+  messages.value = normalizeMessages(records)
+  await focusChatInput()
+  keepChatHistoryPinned(true)
+}
+
+function handleComposerEnter() {
+  if (chatLoading.value) {
+    return
   }
 
-  messages.value = normalizeMessages(await listConversationMessages(conversationId))
+  void handleSend()
+}
+
+function canOpenTraceForMessage(message: ConversationMessage) {
+  return message.roleCode === 'ASSISTANT' && !!message.requestId && message.uiState !== 'thinking'
+}
+
+async function openTraceDialogForMessage(message: ConversationMessage) {
+  const requestId = message.requestId
+  if (!requestId) {
+    return
+  }
+
+  if (requestId !== activeChatRequestId.value || traces.value.length === 0) {
+    traceDialogLoading.value = true
+    traceError.value = ''
+    try {
+      const detail = await getTraceDetail(requestId)
+      traces.value = detail.events
+      activeChatRequestId.value = requestId
+      applyDefaultTraceExpansion()
+    } catch (error) {
+      traceError.value = error instanceof RequestError ? error.message : 'Trace 详情加载失败。'
+    } finally {
+      traceDialogLoading.value = false
+    }
+  }
+
+  traceDialogVisible.value = true
 }
 
 async function handleSendSync() {
@@ -198,6 +445,7 @@ async function handleSendSync() {
     chatError.value = error instanceof RequestError ? error.message : '同步聊天调用失败。'
   } finally {
     chatLoading.value = false
+    await focusChatInput()
   }
 }
 
@@ -248,6 +496,7 @@ async function handleSend() {
         progressMessage: '模型正在思考，请稍候…',
       },
     ]
+    keepChatHistoryPinned(true)
 
     const accepted = await submitChat(buildChatRequest(message))
     activeChatRequestId.value = accepted.requestId
@@ -271,11 +520,16 @@ async function handleSend() {
     chatError.value = error instanceof RequestError ? error.message : '聊天请求提交失败。'
   } finally {
     chatLoading.value = false
+    await focusChatInput()
   }
 }
 
 function validateBeforeSend() {
-  if (modeState.value.enableRag && selectedKnowledgeBaseIds.value.length === 0) {
+  if (
+    modeState.value.enableRag &&
+    effectiveKnowledgeBaseIds.value.length === 0 &&
+    !requestKnowledgeBaseOverride.value.enabled
+  ) {
     chatError.value = '已开启 RAG，请至少选择一个知识库后再发送。'
     return false
   }
@@ -284,13 +538,30 @@ function validateBeforeSend() {
 }
 
 function buildChatRequest(message: string): ChatSendRequest {
-  return {
+  const request: ChatSendRequest = {
     conversationId: activeConversationId.value ?? undefined,
     message,
     enableRag: modeState.value.enableRag,
     enableAgent: modeState.value.enableAgent,
-    knowledgeBaseIds: modeState.value.enableRag ? selectedKnowledgeBaseIds.value : [],
   }
+
+  if (!activeConversationId.value) {
+    request.memoryEnabled = modeState.value.memoryEnabled
+  }
+
+  if (requestKnowledgeBaseOverride.value.enabled) {
+    request.knowledgeBaseIds = [...requestKnowledgeBaseOverride.value.ids]
+  } else if (!modeState.value.enableRag) {
+    request.knowledgeBaseIds = []
+  }
+
+  if (requestMcpServerOverride.value.enabled) {
+    request.mcpServerIds = [...requestMcpServerOverride.value.ids]
+  } else if (!modeState.value.enableAgent) {
+    request.mcpServerIds = []
+  }
+
+  return request
 }
 
 function openChatStream(streamRequestId: string, assistantMessageId: number): Promise<void> {
@@ -431,9 +702,50 @@ function updateAssistantProgress(
 }
 
 function updateConversationCache(conversation: Conversation) {
-  conversations.value = conversations.value.map((item) =>
-    item.id === conversation.id ? conversation : item,
+  const exists = conversations.value.some((item) => item.id === conversation.id)
+  conversations.value = sortConversations(
+    exists
+    ? conversations.value.map((item) => (item.id === conversation.id ? conversation : item))
+    : [conversation, ...conversations.value],
   )
+}
+
+function sortConversations(list: Conversation[]) {
+  return [...list].sort((left, right) => {
+    const rightTimestamp = right.lastMessageAt ?? right.updatedAt ?? 0
+    const leftTimestamp = left.lastMessageAt ?? left.updatedAt ?? 0
+    return rightTimestamp - leftTimestamp
+  })
+}
+
+function applyConversationSettings(conversation: Conversation) {
+  modeState.value.enableRag = conversation.enableRag
+  modeState.value.enableAgent = conversation.enableAgent
+  modeState.value.memoryEnabled = conversation.memoryEnabled
+  selectedKnowledgeBaseIds.value = [...conversation.knowledgeBaseIds]
+  selectedMcpServerIds.value = [...conversation.mcpServerIds]
+}
+
+function resetRequestOverrides() {
+  requestKnowledgeBaseOverride.value = createIdOverrideState()
+  requestMcpServerOverride.value = createIdOverrideState()
+}
+
+function arrayEquals(left: number[], right: number[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function formatModeLabel(enableRag: boolean, enableAgent: boolean) {
+  if (enableRag && enableAgent) {
+    return 'RAG + Agent'
+  }
+  if (enableRag) {
+    return 'RAG'
+  }
+  if (enableAgent) {
+    return 'Agent'
+  }
+  return 'LLM'
 }
 
 async function persistActiveConversationSettings() {
@@ -446,7 +758,10 @@ async function persistActiveConversationSettings() {
   if (
     currentConversation &&
     currentConversation.enableRag === modeState.value.enableRag &&
-    currentConversation.enableAgent === modeState.value.enableAgent
+    currentConversation.enableAgent === modeState.value.enableAgent &&
+    currentConversation.memoryEnabled === modeState.value.memoryEnabled &&
+    arrayEquals(currentConversation.knowledgeBaseIds, selectedKnowledgeBaseIds.value) &&
+    arrayEquals(currentConversation.mcpServerIds, selectedMcpServerIds.value)
   ) {
     return currentConversation
   }
@@ -454,16 +769,39 @@ async function persistActiveConversationSettings() {
   const updatedConversation = await updateConversationSettings(conversationId, {
     enableRag: modeState.value.enableRag,
     enableAgent: modeState.value.enableAgent,
+    memoryEnabled: modeState.value.memoryEnabled,
+    knowledgeBaseIds: [...selectedKnowledgeBaseIds.value],
+    mcpServerIds: [...selectedMcpServerIds.value],
   })
+  applyConversationSettings(updatedConversation)
   updateConversationCache(updatedConversation)
   return updatedConversation
 }
 
-async function handleModeChange() {
+async function handleConversationSettingsChange() {
   try {
     await persistActiveConversationSettings()
   } catch (error) {
-    chatError.value = error instanceof RequestError ? error.message : '会话模式保存失败。'
+    chatError.value = error instanceof RequestError ? error.message : '会话配置保存失败。'
+  }
+}
+
+async function handleClearConversationMemory() {
+  const conversationId = activeConversationId.value
+  if (!conversationId || memoryClearing.value) {
+    return
+  }
+
+  memoryClearing.value = true
+  try {
+    const result = await clearConversationMemory(conversationId)
+    if (result.cleared) {
+      ElMessage.success('当前会话 Memory 已清空。')
+    }
+  } catch (error) {
+    chatError.value = error instanceof RequestError ? error.message : '会话 Memory 清理失败。'
+  } finally {
+    memoryClearing.value = false
   }
 }
 
@@ -666,6 +1004,17 @@ function traceFacts(trace: TraceEvent) {
     ]
   }
 
+  if (trace.eventType === 'CHAT_EXECUTION_SPEC_RESOLVED') {
+    const knowledgeBaseIds = Array.isArray(payload.knowledgeBaseIds) ? payload.knowledgeBaseIds : []
+    const mcpServerIds = Array.isArray(payload.mcpServerIds) ? payload.mcpServerIds : []
+    return [
+      { label: '模式', value: formatScalar(payload.mode) },
+      { label: 'Memory', value: formatBooleanLabel(payload.memoryEnabled) },
+      { label: '知识库', value: formatKnowledgeBaseList(knowledgeBaseIds) },
+      { label: 'MCP Server', value: formatMcpServerList(mcpServerIds) },
+    ]
+  }
+
   if (trace.eventType === 'FINAL_RESPONSE_COMPLETED') {
     return [
       { label: '回答长度', value: formatScalar(payload.answerLength) },
@@ -727,6 +1076,7 @@ function isStructuredTrace(trace: TraceEvent) {
     'RAG_SEGMENTS_SELECTED',
     'RAG_RETRIEVAL_FINISHED',
     'MODEL_REQUEST_STARTED',
+    'CHAT_EXECUTION_SPEC_RESOLVED',
     'FINAL_RESPONSE_COMPLETED',
     'AGENT_TOOLS_ATTACHED',
     'AGENT_TOOLS_UNAVAILABLE',
@@ -806,11 +1156,34 @@ function formatKnowledgeBaseList(ids: unknown[]) {
     .join('、')
 }
 
+function formatMcpServerList(ids: unknown[]) {
+  if (ids.length === 0) {
+    return '未指定'
+  }
+
+  return ids
+    .map((item) => {
+      const numericId = Number(item)
+      return mcpServerNameMap.value.get(numericId) ?? `#${numericId}`
+    })
+    .join('、')
+}
+
 function formatSegmentRefCount(value: unknown) {
   if (!Array.isArray(value)) {
     return '0'
   }
   return String(value.length)
+}
+
+function formatBooleanLabel(value: unknown) {
+  if (value === true) {
+    return '开启'
+  }
+  if (value === false) {
+    return '关闭'
+  }
+  return '未记录'
 }
 
 function formatScalar(value: unknown) {
@@ -841,297 +1214,553 @@ watch(
   { deep: false },
 )
 
+watch(messageRenderSignature, async () => {
+  await nextTick()
+  keepChatHistoryPinned()
+})
+
 onMounted(async () => {
   thinkingTicker = window.setInterval(() => {
     thinkingRenderNow.value = Date.now()
   }, 1000)
-  await Promise.all([loadConversations(false), loadKnowledgeOptions()])
+  await Promise.all([loadConversations(false), loadKnowledgeOptions(), loadMcpServerOptions()])
+  await focusChatInput()
 })
 
 onBeforeUnmount(() => {
   if (thinkingTicker !== null) {
     window.clearInterval(thinkingTicker)
   }
+  if (chatScrollFrame !== null) {
+    window.cancelAnimationFrame(chatScrollFrame)
+  }
   closeStreams()
 })
 </script>
 
 <template>
-  <section class="workspace-grid">
-    <el-card class="panel conversations-panel" shadow="never">
-      <template #header>
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">会话</p>
-            <h2>Conversation</h2>
+  <section class="chat-shell">
+    <aside class="chat-sidebar">
+      <el-card class="panel sidebar-panel" shadow="never">
+        <div class="sidebar-fixed">
+          <RouterLink class="sidebar-brand" to="/chat">
+            <p class="sidebar-brand-eyebrow">LangChain4j Learning Platform</p>
+            <h1 class="sidebar-brand-title">Open Agent Platform</h1>
+          </RouterLink>
+
+          <div class="sidebar-actions">
+            <button class="sidebar-action-button" type="button" @click="createNewConversation">
+              <el-icon><Plus /></el-icon>
+              <span>新聊天</span>
+            </button>
+            <RouterLink class="sidebar-action-button sidebar-action-button--secondary" to="/admin/system">
+              <el-icon><Setting /></el-icon>
+              <span>进入后台管理</span>
+            </RouterLink>
           </div>
-          <el-button type="primary" @click="createNewConversation">新建会话</el-button>
         </div>
-      </template>
 
-      <div v-if="conversations.length === 0" class="empty-state">
-        还没有会话。可以先新建一个，或者直接发送第一条消息让后端自动创建。
-      </div>
+        <div class="sidebar-divider" aria-hidden="true"></div>
 
-      <button
-        v-for="conversation in conversations"
-        :key="conversation.id"
-        class="conversation-item"
-        :class="{ 'conversation-item--active': conversation.id === activeConversationId }"
-        type="button"
-        @click="selectConversation(conversation.id)"
-      >
-        <strong>{{ conversation.title }}</strong>
-        <span>{{ conversation.modeCode }}</span>
-        <span>{{ formatTime(conversation.lastMessageAt ?? conversation.updatedAt) }}</span>
-      </button>
-    </el-card>
+        <div class="sidebar-scroll-area">
+          <div v-if="conversations.length === 0" class="sidebar-empty-state">还没有聊天记录</div>
 
-    <el-card class="panel chat-panel" shadow="never">
-      <template #header>
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">对话主链路</p>
-            <h2>{{ activeConversation?.title ?? '未选择会话' }}</h2>
+          <div v-else class="conversation-list">
+            <article
+              v-for="conversation in conversations"
+              :key="conversation.id"
+              class="conversation-item"
+              :class="{ 'conversation-item--active': conversation.id === activeConversationId }"
+            >
+              <button class="conversation-item-main" type="button" @click="selectConversation(conversation.id)">
+                <strong class="conversation-item-title">{{ conversation.title }}</strong>
+              </button>
+
+              <el-dropdown
+                placement="bottom-end"
+                trigger="click"
+                @command="handleConversationDropdownCommand(conversation, $event)"
+              >
+                <button class="conversation-item-menu" type="button" aria-label="更多操作">
+                  <el-icon><MoreFilled /></el-icon>
+                </button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="open">打开会话</el-dropdown-item>
+                    <el-dropdown-item command="settings">打开会话配置</el-dropdown-item>
+                    <el-dropdown-item command="copy-id">复制会话 ID</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </article>
           </div>
-          <span class="meta-inline">
-            {{ activeConversation ? `会话 #${activeConversation.id}` : '可直接发送首条消息自动创建' }}
-          </span>
         </div>
-      </template>
+      </el-card>
+    </aside>
 
-      <div class="chat-toolbar">
-        <el-switch v-model="modeState.enableRag" active-text="RAG" @change="handleModeChange" />
-        <el-switch v-model="modeState.enableAgent" active-text="Agent" @change="handleModeChange" />
-      </div>
-      <p class="mode-hint">
-        Agent 模式当前会优先挂载“已启用且健康”的 MCP Server 工具；如果没有可用工具，本轮会自动退化为普通模型回答。
-      </p>
-
-      <div class="rag-attach-panel">
-        <div class="rag-attach-head">
-          <strong>本次请求知识库</strong>
-          <span>当前只做请求级绑定，不写回 conversation。</span>
-        </div>
-        <el-select
-          v-model="selectedKnowledgeBaseIds"
-          :disabled="!modeState.enableRag || knowledgeLoading"
-          clearable
-          collapse-tags
-          collapse-tags-tooltip
-          filterable
-          multiple
-          placeholder="开启 RAG 后选择一个或多个知识库"
-        >
-          <el-option
-            v-for="knowledgeBase in availableKnowledgeBases"
-            :key="knowledgeBase.id"
-            :label="`${knowledgeBase.name} · ${knowledgeBase.segmentCount} 段`"
-            :value="knowledgeBase.id"
-          />
-        </el-select>
-        <div v-if="selectedKnowledgeBases.length > 0" class="tag-row">
-          <el-tag
-            v-for="knowledgeBase in selectedKnowledgeBases"
-            :key="knowledgeBase.id"
-            effect="plain"
-            round
-            type="warning"
-          >
-            {{ knowledgeBase.name }}
-          </el-tag>
-        </div>
-        <el-alert
-          v-if="knowledgeError"
-          :closable="false"
-          show-icon
-          title="知识库列表加载失败"
-          type="error"
-        >
-          <template #default>{{ knowledgeError }}</template>
-        </el-alert>
-        <p v-else-if="availableKnowledgeBases.length === 0" class="hint-text">
-          当前还没有可选知识库。可以去 <RouterLink to="/knowledge">知识库页面</RouterLink> 创建后再回来。
-        </p>
-      </div>
-
+    <main class="chat-main">
+    <el-card class="panel chat-stage" shadow="never">
       <el-alert v-if="chatError" :closable="false" show-icon title="聊天请求失败" type="error">
         <template #default>{{ chatError }}</template>
       </el-alert>
 
-      <div class="chat-history">
-        <div v-if="messages.length === 0" class="empty-state">
-          当前会话还没有消息。输入一条内容后，后端会把 user / assistant 消息持久化到
-          `conversation_message`，并在启用 RAG 时附带知识库检索上下文。
+      <div class="chat-history-shell">
+        <div
+          ref="chatHistoryRef"
+          class="chat-history"
+          :class="{ 'chat-history--empty': !chatStarted }"
+          @scroll="handleChatHistoryScroll"
+        >
+          <div v-if="messages.length === 0" class="empty-state">
+            当前会话还没有消息。输入一条内容后，后端会把 user / assistant 消息持久化到
+            `conversation_message`，并在启用 RAG 时附带知识库检索上下文。
+          </div>
+
+          <article
+            v-for="message in messages"
+            :key="`${message.id}-${message.createdAt}`"
+            class="message-item"
+            :class="`message-item--${message.roleCode.toLowerCase()}`"
+          >
+            <div class="message-meta">
+              <strong>{{ message.roleCode }}</strong>
+              <span>{{ formatTime(message.createdAt) }}</span>
+            </div>
+            <p v-if="message.content">{{ message.content }}</p>
+            <div v-else-if="message.roleCode === 'ASSISTANT' && message.uiState === 'thinking'" class="thinking-block">
+              <span class="thinking-dot"></span>
+              <span>{{ message.progressMessage || '模型正在思考，请稍候…' }}</span>
+              <span class="thinking-elapsed">{{ formatThinkingElapsed(message.thinkingStartedAt) }}</span>
+            </div>
+            <p v-else>...</p>
+
+            <div v-if="canOpenTraceForMessage(message)" class="message-actions">
+              <el-button link type="primary" @click="openTraceDialogForMessage(message)">当前轮次摘要</el-button>
+            </div>
+          </article>
         </div>
 
-        <article
-          v-for="message in messages"
-          :key="`${message.id}-${message.createdAt}`"
-          class="message-item"
-          :class="`message-item--${message.roleCode.toLowerCase()}`"
+        <button
+          v-if="showScrollToLatest"
+          class="scroll-to-latest-button"
+          title="回到最新消息"
+          type="button"
+          @click="scrollChatHistoryToBottom(true)"
         >
-          <div class="message-meta">
-            <strong>{{ message.roleCode }}</strong>
-            <span>{{ formatTime(message.createdAt) }}</span>
-          </div>
-          <p v-if="message.content">{{ message.content }}</p>
-          <div v-else-if="message.roleCode === 'ASSISTANT' && message.uiState === 'thinking'" class="thinking-block">
-            <span class="thinking-dot"></span>
-            <span>{{ message.progressMessage || '模型正在思考，请稍候…' }}</span>
-            <span class="thinking-elapsed">{{ formatThinkingElapsed(message.thinkingStartedAt) }}</span>
-          </div>
-          <p v-else>...</p>
-        </article>
+          <span aria-hidden="true">↓</span>
+        </button>
       </div>
 
-      <div class="chat-editor">
+      <div class="chat-editor" :class="{ 'chat-editor--welcome': !chatStarted }">
+        <div class="editor-topbar">
+          <div class="stage-facts">
+            <span v-for="item in stageFactItems" :key="`${item.label}-${item.value}`" class="stage-fact-pill">
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.value }}</small>
+            </span>
+          </div>
+          <span class="editor-shortcut">Enter 发送 · Shift + Enter 换行</span>
+        </div>
+
         <el-input
+          ref="chatInputRef"
           v-model="chatInput"
-          :autosize="{ minRows: 4, maxRows: 8 }"
+          :autosize="{ minRows: 3, maxRows: 7 }"
           :disabled="chatLoading"
           maxlength="20000"
+          @keydown.enter.exact.prevent="handleComposerEnter"
           placeholder="输入一条消息，验证会话、Trace 与 RAG 上下文注入。"
           resize="none"
           show-word-limit
           type="textarea"
         />
 
-        <div class="meta-row">
-          <span>聊天 requestId：{{ activeChatRequestId || '未发送' }}</span>
-          <span>已选知识库：{{ selectedKnowledgeBaseIds.length }}</span>
-        </div>
-
         <div class="chat-actions">
-          <el-button :disabled="chatLoading" @click="handleSendSync">同步发送</el-button>
-          <el-button :loading="chatLoading" type="primary" @click="handleSend">流式发送</el-button>
+          <button
+            class="editor-action-button editor-action-button--config"
+            title="打开模式、Memory、知识库和 MCP 配置"
+            type="button"
+            @click="settingsDrawerVisible = true"
+          >
+            <el-icon><Setting /></el-icon>
+            <span>聊天配置</span>
+          </button>
+
+          <div class="chat-actions-primary">
+            <button
+              :disabled="chatLoading"
+              class="editor-action-button editor-action-button--primary"
+              title="优先使用流式输出，边生成边返回"
+              type="button"
+              @click="handleSend"
+            >
+              <span>{{ chatLoading ? '发送中...' : '流式发送' }}</span>
+            </button>
+            <button
+              :disabled="chatLoading"
+              class="editor-action-button editor-action-button--secondary"
+              title="等待完整结果后一次性返回"
+              type="button"
+              @click="handleSendSync"
+            >
+              <span>同步发送</span>
+            </button>
+          </div>
         </div>
       </div>
     </el-card>
+    </main>
+  </section>
 
-    <el-card class="panel trace-panel" shadow="never">
-      <template #header>
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">Trace</p>
-            <h2>Request Timeline</h2>
+  <el-dialog v-model="traceDialogVisible" title="当前轮次摘要" width="880px">
+    <div class="trace-dialog">
+      <div class="trace-dialog-head">
+        <div class="trace-summary-grid">
+          <div class="trace-summary-card">
+            <span>requestId</span>
+            <strong>{{ currentRoundSummary.requestId || '未发送' }}</strong>
           </div>
-          <div class="trace-toolbar">
-            <el-select v-model="traceFilter" class="trace-filter-select">
-              <el-option label="全部事件" value="ALL" />
-              <el-option label="只看 RAG" value="RAG" />
-              <el-option label="只看 MODEL" value="MODEL" />
-              <el-option label="只看 TOOL" value="TOOL" />
-              <el-option label="只看失败" value="FAILED" />
-            </el-select>
-            <el-button link @click="applyDefaultTraceExpansion">按默认折叠</el-button>
-            <el-button link @click="expandAllTraces">展开全部</el-button>
+          <div class="trace-summary-card">
+            <span>模式</span>
+            <strong>{{ activeModeLabel }}</strong>
+            <small>{{ currentRoundSummary.requestStatus }}</small>
+          </div>
+          <div class="trace-summary-card">
+            <span>知识库</span>
+            <strong>{{ currentRoundSummary.knowledgeBaseText }}</strong>
+          </div>
+          <div class="trace-summary-card">
+            <span>RAG</span>
+            <strong>{{ currentRoundSummary.ragStatus }}</strong>
+            <small>命中 {{ currentRoundSummary.retrievedCount }} 个片段</small>
           </div>
         </div>
-      </template>
 
-      <el-alert v-if="traceError" :closable="false" show-icon title="Trace 订阅失败" type="error">
+        <div class="trace-toolbar">
+          <el-select v-model="traceFilter" class="trace-filter-select">
+            <el-option label="全部事件" value="ALL" />
+            <el-option label="只看 RAG" value="RAG" />
+            <el-option label="只看 MODEL" value="MODEL" />
+            <el-option label="只看 TOOL" value="TOOL" />
+            <el-option label="只看失败" value="FAILED" />
+          </el-select>
+          <el-button link @click="applyDefaultTraceExpansion">按默认折叠</el-button>
+          <el-button link @click="expandAllTraces">展开全部</el-button>
+        </div>
+      </div>
+
+      <el-alert v-if="traceError" :closable="false" show-icon title="Trace 详情加载失败" type="error">
         <template #default>{{ traceError }}</template>
       </el-alert>
 
-      <div class="trace-summary-grid">
-        <div class="trace-summary-card">
-          <span>当前 requestId</span>
-          <strong>{{ currentRoundSummary.requestId || '未发送' }}</strong>
-        </div>
-        <div class="trace-summary-card">
-          <span>选中知识库</span>
-          <strong>{{ currentRoundSummary.knowledgeBaseText }}</strong>
-        </div>
-        <div class="trace-summary-card">
-          <span>召回片段数</span>
-          <strong>{{ currentRoundSummary.retrievedCount }}</strong>
-        </div>
-        <div class="trace-summary-card">
-          <span>RAG 状态</span>
-          <strong>{{ currentRoundSummary.ragStatus }}</strong>
-          <small>{{ currentRoundSummary.requestStatus }}</small>
-        </div>
-      </div>
+      <div v-loading="traceDialogLoading" class="trace-list">
+        <div v-if="traces.length === 0" class="empty-state">当前还没有可展示的 Trace 事件。</div>
 
-      <div v-if="traces.length === 0" class="empty-state">
-        当前还没有 trace 事件。发送消息后，这里会展示 `USER_MESSAGE_RECEIVED`、
-        `RAG_RETRIEVAL_STARTED`、`TOOL_EXECUTION_REQUESTED`、`TOOL_EXECUTION_COMPLETED`、
-        `FINAL_RESPONSE_COMPLETED` 等过程事件。
-      </div>
-
-      <div v-else-if="filteredTraces.length === 0" class="empty-state">
-        当前筛选条件下没有匹配的 Trace 事件，可以切换过滤条件查看完整时间线。
-      </div>
-
-      <article v-for="trace in filteredTraces" :key="trace.id" class="trace-item">
-        <div class="trace-head">
-          <div class="trace-head-main">
-            <strong>{{ traceTitle(trace) }}</strong>
-            <span>{{ formatTime(trace.createdAt) }}</span>
-          </div>
-          <el-button link type="primary" @click="toggleTraceExpanded(trace.id)">
-            {{ isTraceExpanded(trace.id) ? '收起详情' : '展开详情' }}
-          </el-button>
+        <div v-else-if="filteredTraces.length === 0" class="empty-state">
+          当前筛选条件下没有匹配的 Trace 事件。
         </div>
-        <div class="trace-meta">
-          <span>{{ trace.eventType }}</span>
-          <span>{{ trace.eventStage || 'NO_STAGE' }}</span>
-          <span>{{ trace.eventSource }}</span>
-          <span>{{ trace.successFlag ? 'SUCCESS' : 'FAILED' }}</span>
-        </div>
-        <div v-if="isTraceExpanded(trace.id)" class="trace-body">
-          <p v-if="traceDescription(trace)" class="trace-description">{{ traceDescription(trace) }}</p>
-          <div v-if="traceFacts(trace).length > 0" class="trace-facts">
-            <div v-for="fact in traceFacts(trace)" :key="`${trace.id}-${fact.label}`" class="trace-fact">
-              <span>{{ fact.label }}</span>
-              <strong>{{ fact.value }}</strong>
+
+        <article v-for="trace in filteredTraces" :key="trace.id" class="trace-item">
+          <div class="trace-head">
+            <div class="trace-head-main">
+              <strong>{{ traceTitle(trace) }}</strong>
+              <span>{{ formatTime(trace.createdAt) }}</span>
             </div>
+            <el-button link type="primary" @click="toggleTraceExpanded(trace.id)">
+              {{ isTraceExpanded(trace.id) ? '收起详情' : '展开详情' }}
+            </el-button>
           </div>
-          <div v-if="selectedSegmentRefs(trace).length > 0" class="segment-ref-list">
-            <div class="segment-ref-head">命中片段引用</div>
-            <code v-for="segmentRef in selectedSegmentRefs(trace)" :key="segmentRef">{{ segmentRef }}</code>
+          <div class="trace-meta">
+            <span>{{ trace.eventType }}</span>
+            <span>{{ trace.eventStage || 'NO_STAGE' }}</span>
+            <span>{{ trace.eventSource }}</span>
+            <span>{{ trace.successFlag ? 'SUCCESS' : 'FAILED' }}</span>
           </div>
-          <details class="trace-raw" :open="!isStructuredTrace(trace)">
-            <summary>原始 Payload</summary>
-            <pre>{{ formatTracePayload(trace.eventPayloadJson) }}</pre>
-          </details>
+          <div v-if="isTraceExpanded(trace.id)" class="trace-body">
+            <p v-if="traceDescription(trace)" class="trace-description">{{ traceDescription(trace) }}</p>
+            <div v-if="traceFacts(trace).length > 0" class="trace-facts">
+              <div v-for="fact in traceFacts(trace)" :key="`${trace.id}-${fact.label}`" class="trace-fact">
+                <span>{{ fact.label }}</span>
+                <strong>{{ fact.value }}</strong>
+              </div>
+            </div>
+            <div v-if="selectedSegmentRefs(trace).length > 0" class="segment-ref-list">
+              <div class="segment-ref-head">命中片段引用</div>
+              <code v-for="segmentRef in selectedSegmentRefs(trace)" :key="segmentRef">{{ segmentRef }}</code>
+            </div>
+            <details class="trace-raw" :open="!isStructuredTrace(trace)">
+              <summary>原始 Payload</summary>
+              <pre>{{ formatTracePayload(trace.eventPayloadJson) }}</pre>
+            </details>
+          </div>
+        </article>
+      </div>
+    </div>
+  </el-dialog>
+
+  <el-drawer
+    v-model="settingsDrawerVisible"
+    :title="activeConversationId ? '会话配置与本轮覆盖' : '发送前配置草稿'"
+    direction="rtl"
+    size="480px"
+  >
+    <div class="drawer-intro">
+      <p>
+        {{
+          activeConversationId
+            ? '这里集中管理当前会话的默认配置，以及本轮运行时的临时覆盖。默认配置会写回会话；覆盖配置只影响本轮。'
+            : '当前还没有选中会话；模式与本轮覆盖可直接参与首轮发送，默认知识库 / MCP 绑定需在具体会话上保存。'
+        }}
+      </p>
+    </div>
+
+    <div class="settings-panel">
+      <div class="rag-attach-head">
+        <strong>会话默认配置</strong>
+        <span>{{ activeConversationId ? '修改后会立即保存到当前会话。' : '当前仅保留发送前草稿。' }}</span>
+      </div>
+
+      <div class="chat-toolbar">
+        <el-switch v-model="modeState.enableRag" active-text="启用 RAG" @change="handleConversationSettingsChange" />
+        <el-switch
+          v-model="modeState.enableAgent"
+          active-text="启用 Agent"
+          @change="handleConversationSettingsChange"
+        />
+        <el-switch
+          v-model="modeState.memoryEnabled"
+          active-text="启用 Memory"
+          @change="handleConversationSettingsChange"
+        />
+      </div>
+
+      <p class="mode-hint">
+        Agent 模式当前会优先挂载“已启用且健康”的 MCP Server 工具；如果没有可用工具，本轮会自动退化为普通模型回答。
+      </p>
+
+      <div class="settings-grid">
+        <div class="settings-block">
+          <div class="settings-inline-head">
+            <span class="settings-label">默认知识库</span>
+            <small>{{ activeConversationId ? '持久化到会话绑定' : '先选择会话后可保存' }}</small>
+          </div>
+          <el-select
+            v-model="selectedKnowledgeBaseIds"
+            :disabled="!activeConversationId || !modeState.enableRag || knowledgeLoading"
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            multiple
+            placeholder="为当前会话选择默认知识库"
+            @change="handleConversationSettingsChange"
+          >
+            <el-option
+              v-for="knowledgeBase in availableKnowledgeBases"
+              :key="knowledgeBase.id"
+              :label="`${knowledgeBase.name} · ${knowledgeBase.segmentCount} 段`"
+              :value="knowledgeBase.id"
+            />
+          </el-select>
+          <div v-if="selectedKnowledgeBases.length > 0" class="tag-row">
+            <el-tag
+              v-for="knowledgeBase in selectedKnowledgeBases"
+              :key="knowledgeBase.id"
+              effect="plain"
+              round
+              type="warning"
+            >
+              {{ knowledgeBase.name }}
+            </el-tag>
+          </div>
         </div>
-      </article>
-    </el-card>
-  </section>
+
+        <div class="settings-block">
+          <div class="settings-inline-head">
+            <span class="settings-label">默认 MCP Server</span>
+            <small>{{ activeConversationId ? '持久化到会话绑定' : '先选择会话后可保存' }}</small>
+          </div>
+          <el-select
+            v-model="selectedMcpServerIds"
+            :disabled="!activeConversationId || !modeState.enableAgent || mcpLoading"
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            multiple
+            placeholder="为当前会话选择默认 MCP Server"
+            @change="handleConversationSettingsChange"
+          >
+            <el-option
+              v-for="server in availableMcpServers"
+              :key="server.id"
+              :label="`${server.name} · ${server.healthStatus} · ${server.toolCount} tools`"
+              :value="server.id"
+            />
+          </el-select>
+          <div v-if="selectedMcpServers.length > 0" class="tag-row">
+            <el-tag v-for="server in selectedMcpServers" :key="server.id" effect="plain" round type="success">
+              {{ server.name }}
+            </el-tag>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <el-button
+          :disabled="!activeConversationId || memoryClearing"
+          :loading="memoryClearing"
+          plain
+          @click="handleClearConversationMemory"
+        >
+          清空会话 Memory
+        </el-button>
+      </div>
+
+      <el-alert v-if="knowledgeError" :closable="false" show-icon title="知识库列表加载失败" type="error">
+        <template #default>{{ knowledgeError }}</template>
+      </el-alert>
+      <el-alert v-if="mcpError" :closable="false" show-icon title="MCP Server 列表加载失败" type="error">
+        <template #default>{{ mcpError }}</template>
+      </el-alert>
+      <p v-if="!knowledgeError && availableKnowledgeBases.length === 0" class="hint-text">
+        当前还没有可选知识库。可以去 <RouterLink to="/admin/knowledge">知识库页面</RouterLink> 创建后再回来。
+      </p>
+    </div>
+
+    <div class="settings-panel">
+      <div class="rag-attach-head">
+        <strong>本次请求覆盖</strong>
+        <span>只影响当前轮运行时，不会写回会话默认配置。</span>
+      </div>
+
+      <div class="settings-grid settings-grid--request">
+        <div class="settings-block">
+          <div class="settings-inline-head">
+            <span class="settings-label">知识库覆盖</span>
+            <el-switch
+              v-model="requestKnowledgeBaseOverride.enabled"
+              :disabled="!modeState.enableRag"
+              active-text="启用覆盖"
+            />
+          </div>
+          <el-select
+            v-model="requestKnowledgeBaseOverride.ids"
+            :disabled="!modeState.enableRag || !requestKnowledgeBaseOverride.enabled || knowledgeLoading"
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            multiple
+            placeholder="不启用覆盖时，自动回落到会话默认知识库"
+          >
+            <el-option
+              v-for="knowledgeBase in availableKnowledgeBases"
+              :key="knowledgeBase.id"
+              :label="`${knowledgeBase.name} · ${knowledgeBase.segmentCount} 段`"
+              :value="knowledgeBase.id"
+            />
+          </el-select>
+          <p class="hint-text">
+            {{
+              requestKnowledgeBaseOverride.enabled
+                ? requestKnowledgeBaseOverride.ids.length > 0
+                  ? `本轮显式覆盖 ${requestKnowledgeBaseOverride.ids.length} 个知识库。`
+                  : '本轮显式清空知识库绑定；即使会话已绑定，也不再注入。'
+                : `当前回落到会话默认：${selectedKnowledgeBaseIds.length} 个知识库。`
+            }}
+          </p>
+        </div>
+
+        <div class="settings-block">
+          <div class="settings-inline-head">
+            <span class="settings-label">MCP Server 覆盖</span>
+            <el-switch
+              v-model="requestMcpServerOverride.enabled"
+              :disabled="!modeState.enableAgent"
+              active-text="启用覆盖"
+            />
+          </div>
+          <el-select
+            v-model="requestMcpServerOverride.ids"
+            :disabled="!modeState.enableAgent || !requestMcpServerOverride.enabled || mcpLoading"
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            filterable
+            multiple
+            placeholder="不启用覆盖时，自动回落到会话默认 MCP Server"
+          >
+            <el-option
+              v-for="server in availableMcpServers"
+              :key="server.id"
+              :label="`${server.name} · ${server.healthStatus} · ${server.toolCount} tools`"
+              :value="server.id"
+            />
+          </el-select>
+          <p class="hint-text">
+            {{
+              requestMcpServerOverride.enabled
+                ? requestMcpServerOverride.ids.length > 0
+                  ? `本轮显式覆盖 ${requestMcpServerOverride.ids.length} 个 MCP Server。`
+                  : '本轮显式清空 MCP 绑定；即使会话已绑定，也不挂载工具。'
+                : `当前回落到会话默认：${selectedMcpServerIds.length} 个 MCP Server。`
+            }}
+          </p>
+        </div>
+      </div>
+    </div>
+  </el-drawer>
 </template>
 
 <style scoped>
-.workspace-grid {
+.chat-shell {
   display: grid;
-  gap: 20px;
-  grid-template-columns: minmax(240px, 0.85fr) minmax(0, 1.4fr) minmax(320px, 1fr);
-  align-items: start;
+  gap: 14px;
+  grid-template-columns: 292px minmax(0, 1fr);
+  align-items: stretch;
+  height: 100vh;
+  padding: 12px 10px 12px 0;
+  overflow: hidden;
+}
+
+.chat-sidebar {
+  min-width: 0;
+  position: sticky;
+  top: 12px;
+  align-self: stretch;
+  height: calc(100vh - 24px);
+}
+
+.chat-main {
+  min-width: 0;
+  height: calc(100vh - 24px);
+  width: 100%;
+  max-width: none;
+  justify-self: stretch;
 }
 
 .panel {
-  min-height: 640px;
+  min-height: 0;
   border: 1px solid rgba(15, 23, 42, 0.08);
   background: rgba(255, 255, 255, 0.86);
   backdrop-filter: blur(12px);
 }
 
-.conversations-panel {
+.sidebar-panel {
+  height: 100%;
+  border-left: none;
+  border-radius: 0 24px 24px 0;
   background:
     linear-gradient(180deg, rgba(246, 249, 252, 0.96), rgba(255, 255, 255, 0.88)),
     rgba(255, 255, 255, 0.86);
 }
 
-.chat-panel {
+.chat-stage {
+  border-radius: 22px;
+  height: 100%;
   background:
     linear-gradient(180deg, rgba(255, 252, 244, 0.96), rgba(255, 255, 255, 0.9)),
-    rgba(255, 255, 255, 0.86);
-}
-
-.trace-panel {
-  background:
-    linear-gradient(180deg, rgba(241, 247, 255, 0.96), rgba(255, 255, 255, 0.9)),
     rgba(255, 255, 255, 0.86);
 }
 
@@ -1144,7 +1773,7 @@ onBeforeUnmount(() => {
 
 .section-head h2 {
   margin: 0;
-  font-size: 24px;
+  font-size: 20px;
 }
 
 .section-kicker {
@@ -1157,8 +1786,7 @@ onBeforeUnmount(() => {
 
 .meta-inline,
 .trace-meta,
-.message-meta,
-.meta-row {
+.message-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 10px 16px;
@@ -1166,58 +1794,257 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
-.conversations-panel,
-.trace-panel,
-.chat-panel {
+.sidebar-panel,
+.chat-stage,
+.trace-inline-panel {
   display: grid;
-  gap: 12px;
+  gap: 10px;
+}
+
+:deep(.chat-stage > .el-card__body) {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  padding: 16px 18px 18px;
+}
+
+:deep(.sidebar-panel > .el-card__body) {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+
+.sidebar-fixed {
+  display: grid;
+  gap: 14px;
+  padding: 18px 16px 14px;
+}
+
+.sidebar-brand {
+  display: grid;
+  gap: 2px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.sidebar-brand-eyebrow {
+  margin: 0;
+  color: #8b5e21;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.sidebar-brand-title {
+  margin: 0;
+  color: #0f172a;
+  font-size: clamp(18px, 1.8vw, 22px);
+  line-height: 1.15;
+}
+
+.sidebar-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.sidebar-action-button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid rgba(31, 78, 121, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.74);
+  color: #123b63;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  opacity: 0.94;
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.sidebar-action-button:hover {
+  opacity: 1;
+  transform: translateY(-1px);
+  border-color: rgba(31, 78, 121, 0.26);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.06);
+}
+
+.sidebar-action-button .el-icon {
+  font-size: 15px;
+}
+
+.sidebar-action-button--secondary {
+  color: #3c4f61;
+}
+
+.sidebar-divider {
+  height: 1px;
+  margin: 0 16px;
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.sidebar-scroll-area {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 10px 14px 12px;
+}
+
+.sidebar-empty-state {
+  padding: 10px 8px;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .conversation-item {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 6px;
-  width: 100%;
-  padding: 14px 16px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 16px;
-  background: rgba(248, 250, 252, 0.9);
-  text-align: left;
-  cursor: pointer;
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.62);
   transition:
     transform 160ms ease,
-    border-color 160ms ease;
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background 160ms ease;
 }
 
 .conversation-item:hover,
 .conversation-item--active {
-  transform: translateY(-1px);
-  border-color: rgba(31, 78, 121, 0.45);
-  background:
-    linear-gradient(135deg, rgba(255, 248, 230, 0.9), rgba(255, 255, 255, 0.96)),
-    rgba(248, 250, 252, 0.9);
-  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
+  border-color: rgba(31, 78, 121, 0.28);
+  background: linear-gradient(135deg, rgba(255, 248, 230, 0.76), rgba(255, 255, 255, 0.92));
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+}
+
+.conversation-item-main {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+  padding: 10px 0 10px 12px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
 }
 
 .conversation-item strong {
   color: #0f172a;
 }
 
-.conversation-item span {
+.conversation-item-menu {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 6px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
   color: #64748b;
-  font-size: 13px;
+  opacity: 0.48;
+  cursor: pointer;
+  transition:
+    opacity 140ms ease,
+    background 140ms ease,
+    color 140ms ease;
 }
 
-.chat-toolbar,
-.chat-actions {
+.conversation-item:hover .conversation-item-menu,
+.conversation-item:focus-within .conversation-item-menu,
+.conversation-item--active .conversation-item-menu {
+  opacity: 1;
+  background: rgba(15, 23, 42, 0.06);
+  color: #0f172a;
+}
+
+.chat-toolbar {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.sidebar-footnote {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.conversation-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.conversation-list {
+  display: grid;
+  gap: 6px;
+}
+
+.trace-inline-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+
+.trace-inline-head h3 {
+  margin: 0;
+}
+
+.stage-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stage-fact-pill {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(248, 250, 252, 0.9);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  color: #516172;
+  font-size: 12px;
+}
+
+.stage-fact-pill strong {
+  color: #0f172a;
+  font-size: 12px;
+}
+
+.stage-fact-pill small {
+  color: #64748b;
+}
+
+.trace-inline-head h3 {
+  font-size: 20px;
 }
 
 .mode-hint {
   margin: 0;
   color: #64748b;
-  font-size: 13px;
-  line-height: 1.7;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .rag-attach-panel {
@@ -1237,6 +2064,104 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.conversation-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.overview-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.overview-card span,
+.overview-card small {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.overview-card strong {
+  color: #0f172a;
+  line-height: 1.5;
+}
+
+.trace-inline-panel,
+.drawer-intro {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.trace-list {
+  display: grid;
+  gap: 12px;
+}
+
+.trace-panel-note {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.settings-panel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.settings-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-grid--request {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-block {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.78);
+}
+
+.settings-inline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-inline-head small {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.settings-label {
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .tag-row {
   display: flex;
   flex-wrap: wrap;
@@ -1251,36 +2176,75 @@ onBeforeUnmount(() => {
 
 .chat-history {
   display: grid;
-  gap: 14px;
-  min-height: 400px;
-  padding: 18px;
-  margin: 16px 0;
-  border-radius: 20px;
-  background: linear-gradient(180deg, rgba(248, 250, 252, 0.94), rgba(241, 245, 249, 0.72));
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  padding: 16px 44px 14px;
+  margin: 4px 0;
+  border-radius: 22px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.9), rgba(241, 245, 249, 0.68));
+}
+
+.chat-history--empty {
+  min-height: 0;
+  align-content: center;
+}
+
+.chat-history-shell {
+  position: relative;
+  flex: 1;
+  min-height: 0;
 }
 
 .message-item {
-  max-width: min(100%, 760px);
-  padding: 16px 18px;
-  border-radius: 18px;
-  background: white;
+  max-width: min(82%, 840px);
+  padding: 14px 16px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.04);
 }
 
 .message-item--user {
   justify-self: end;
-  background: #1f4e79;
+  max-width: min(74%, 720px);
+  border-radius: 20px 20px 8px 20px;
+  background: linear-gradient(135deg, #1f4e79, #285f8e);
   color: #f8fafc;
 }
 
 .message-item--assistant {
   justify-self: start;
-  border: 1px solid rgba(15, 23, 42, 0.08);
+  max-width: min(86%, 920px);
+  border: 1px solid rgba(15, 23, 42, 0.06);
+  border-radius: 20px 20px 20px 8px;
+}
+
+.message-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+
+.message-item--assistant:hover .message-actions,
+.message-item--assistant:focus-within .message-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .message-item p {
   margin: 8px 0 0;
   white-space: pre-wrap;
   line-height: 1.75;
+}
+
+.message-meta strong {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .thinking-block {
@@ -1306,9 +2270,136 @@ onBeforeUnmount(() => {
   color: #64748b;
 }
 
+.scroll-to-latest-button {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid rgba(31, 78, 121, 0.16);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #1f4e79;
+  font-size: 18px;
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.12);
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    opacity 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease;
+}
+
+.scroll-to-latest-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(31, 78, 121, 0.28);
+  background: rgba(255, 255, 255, 0.98);
+}
+
 .chat-editor {
   display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.chat-editor--welcome {
+  padding: 14px 16px;
+  background: linear-gradient(145deg, rgba(255, 248, 230, 0.62), rgba(255, 255, 255, 0.92));
+}
+
+.editor-topbar {
+  display: flex;
+  justify-content: space-between;
   gap: 12px;
+  align-items: center;
+}
+
+.editor-shortcut {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.chat-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chat-actions-primary {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.editor-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #274865;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
+}
+
+.editor-action-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(31, 78, 121, 0.22);
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
+}
+
+.editor-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.editor-action-button--config {
+  background: rgba(255, 255, 255, 0.64);
+  color: #435669;
+}
+
+.editor-action-button--primary {
+  border-color: rgba(31, 78, 121, 0.18);
+  background: linear-gradient(135deg, #1f4e79, #285f8e);
+  color: #f8fafc;
+}
+
+.editor-action-button--primary:hover:not(:disabled) {
+  border-color: rgba(31, 78, 121, 0.3);
+  background: linear-gradient(135deg, #224f7b, #2e6798);
+}
+
+.editor-action-button--secondary {
+  background: rgba(244, 247, 251, 0.88);
+  color: #667789;
+  font-weight: 500;
+}
+
+.trace-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.trace-dialog-head {
+  display: grid;
+  gap: 14px;
 }
 
 .trace-toolbar,
@@ -1448,21 +2539,126 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1200px) {
-  .workspace-grid {
+  .chat-shell {
     grid-template-columns: 1fr;
+    height: auto;
+    padding: 12px;
+    overflow: visible;
+  }
+
+  .chat-sidebar {
+    position: static;
+    height: auto;
+  }
+
+  .sidebar-panel {
+    min-height: 0;
+    height: auto;
+    border-left: 1px solid rgba(15, 23, 42, 0.08);
+    border-radius: 22px;
+  }
+
+  :deep(.sidebar-panel > .el-card__body) {
+    min-height: 0;
+    height: auto;
+  }
+
+  .sidebar-scroll-area {
+    overflow: visible;
+  }
+
+  .chat-main {
+    height: auto;
+    width: 100%;
+    max-width: none;
+  }
+
+  .chat-stage {
+    height: auto;
+    border-radius: 22px;
+  }
+
+  :deep(.chat-stage > .el-card__body) {
+    height: auto;
+  }
+
+  .chat-history {
+    max-height: 68vh;
+    padding: 14px 24px 12px;
+  }
+
+  .message-item {
+    max-width: min(86%, 760px);
+  }
+
+  .message-item--user {
+    max-width: min(78%, 680px);
+  }
+
+  .message-item--assistant {
+    max-width: min(88%, 820px);
+  }
+
+  .conversation-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 768px) {
   .section-head,
+  .trace-inline-head,
+  .editor-topbar,
   .chat-actions,
   .trace-head,
   .rag-attach-head,
+  .settings-inline-head,
   .trace-head-main {
     flex-direction: column;
     align-items: flex-start;
   }
 
+  .chat-actions-primary {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .editor-action-button,
+  .chat-actions-primary .editor-action-button {
+    width: 100%;
+  }
+
+  .chat-shell {
+    padding: 8px;
+  }
+
+  .chat-history {
+    padding: 12px;
+  }
+
+  .message-item {
+    max-width: min(92%, 100%);
+  }
+
+  .message-item--user,
+  .message-item--assistant {
+    max-width: min(92%, 100%);
+  }
+
+  .sidebar-fixed {
+    padding: 14px 14px 12px;
+  }
+
+  .sidebar-divider {
+    margin: 0 14px;
+  }
+
+  .sidebar-scroll-area {
+    padding: 10px 8px 12px 10px;
+  }
+
+  .conversation-overview-grid,
+  .settings-grid,
+  .settings-grid--request,
   .trace-summary-grid,
   .trace-facts {
     grid-template-columns: 1fr;

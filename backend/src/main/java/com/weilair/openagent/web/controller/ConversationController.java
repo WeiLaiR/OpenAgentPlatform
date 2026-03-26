@@ -6,6 +6,7 @@ import com.weilair.openagent.common.response.ApiResponse;
 import com.weilair.openagent.conversation.service.ConversationService;
 import com.weilair.openagent.web.dto.ConversationCreateRequest;
 import com.weilair.openagent.web.dto.ConversationSettingsUpdateRequest;
+import com.weilair.openagent.web.vo.ConversationMemoryClearVO;
 import com.weilair.openagent.web.vo.ConversationMessageVO;
 import com.weilair.openagent.web.vo.ConversationVO;
 import jakarta.validation.Valid;
@@ -42,11 +43,21 @@ public class ConversationController {
         return ApiResponse.success(conversationService.listMessages(conversationId));
     }
 
+    @GetMapping("/{conversationId}/settings")
+    public ApiResponse<ConversationVO> getSettings(@PathVariable Long conversationId) {
+        return ApiResponse.success(conversationService.getSettings(conversationId));
+    }
+
     @PutMapping("/{conversationId}/settings")
     public ApiResponse<ConversationVO> updateSettings(
             @PathVariable Long conversationId,
             @Valid @RequestBody ConversationSettingsUpdateRequest request
     ) {
         return ApiResponse.success(conversationService.updateSettings(conversationId, request));
+    }
+
+    @PostMapping("/{conversationId}/memory/clear")
+    public ApiResponse<ConversationMemoryClearVO> clearMemory(@PathVariable Long conversationId) {
+        return ApiResponse.success(conversationService.clearMemory(conversationId));
     }
 }

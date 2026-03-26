@@ -44,4 +44,8 @@ public class ConversationMemoryService {
                 .alwaysKeepSystemMessageFirst(Boolean.TRUE.equals(memorySpec.alwaysKeepSystemMessageFirst()))
                 .build();
     }
+
+    public void clearMemory(Long conversationId) {
+        chatMemoryStore.deleteMessages(conversationId);
+    }
 }

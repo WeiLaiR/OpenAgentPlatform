@@ -4,7 +4,7 @@ import java.util.List;
 import java.util.Objects;
 
 import com.weilair.openagent.chat.model.ChatMode;
-import com.weilair.openagent.conversation.model.ConversationDO;
+import com.weilair.openagent.conversation.service.ConversationSettingsSnapshot;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import org.springframework.stereotype.Component;
 
@@ -22,28 +22,55 @@ public class ModeResolver {
      * 也应继续在这里做优先级收口，而不是让下游 service 自己再判一次。
      */
     public ChatExecutionSpec resolve(
-            ConversationDO conversation,
+            ConversationSettingsSnapshot snapshot,
             ChatSendRequest request,
             boolean streaming
     ) {
         ChatMode mode = ChatMode.fromFlags(
-                request.enableRag() != null ? request.enableRag() : conversation.getEnableRag(),
-                request.enableAgent() != null ? request.enableAgent() : conversation.getEnableAgent()
+                request.enableRag() != null ? request.enableRag() : snapshot.enableRag(),
+                request.enableAgent() != null ? request.enableAgent() : snapshot.enableAgent()
         );
 
         return new ChatExecutionSpec(
                 mode,
                 streaming,
-                Boolean.TRUE.equals(conversation.getMemoryEnabled()),
-                resolveKnowledgeBaseIds(mode, request)
+                request.memoryEnabled() != null ? request.memoryEnabled() : snapshot.memoryEnabled(),
+                resolveKnowledgeBaseIds(mode, request, snapshot),
+                resolveMcpServerIds(mode, request, snapshot)
         );
     }
 
-    private List<Long> resolveKnowledgeBaseIds(ChatMode mode, ChatSendRequest request) {
-        if (mode == null || !mode.ragEnabled() || request.knowledgeBaseIds() == null) {
+    private List<Long> resolveKnowledgeBaseIds(
+            ChatMode mode,
+            ChatSendRequest request,
+            ConversationSettingsSnapshot snapshot
+    ) {
+        if (mode == null || !mode.ragEnabled()) {
             return List.of();
         }
-        return request.knowledgeBaseIds().stream()
+
+        List<Long> requestedIds = request.knowledgeBaseIds() != null
+                ? request.knowledgeBaseIds()
+                : snapshot.knowledgeBaseIds();
+        return requestedIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+    }
+
+    private List<Long> resolveMcpServerIds(
+            ChatMode mode,
+            ChatSendRequest request,
+            ConversationSettingsSnapshot snapshot
+    ) {
+        if (mode == null || !mode.agentEnabled()) {
+            return List.of();
+        }
+
+        List<Long> requestedIds = request.mcpServerIds() != null
+                ? request.mcpServerIds()
+                : snapshot.mcpServerIds();
+        return requestedIds.stream()
                 .filter(Objects::nonNull)
                 .distinct()
                 .toList();

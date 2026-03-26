@@ -86,24 +86,25 @@ onMounted(loadHealth)
       </template>
 
       <p class="lead">
-        当前前端已经从单页联调面板拆成独立页面：系统页负责查看运行状态，对话页负责验证会话、
-        Trace 与 RAG 主链路，知识库页负责文件级管理与检索测试。
+        后台管理区现在只承接运行状态、知识库维护和 MCP 维护；会话创建、发送与 Trace 主观察入口已经收回聊天前台。
       </p>
 
-      <div class="jump-grid">
-        <RouterLink class="jump-card" to="/chat">
-          <strong>进入对话页</strong>
-          <span>查看会话、流式响应、RAG 检索事件和 Trace 时间线。</span>
+      <div class="entry-strip">
+        <RouterLink class="entry-pill" to="/chat">
+          <strong>返回聊天前台</strong>
+          <span>继续会话、发送消息并查看本轮 Trace 摘要。</span>
         </RouterLink>
-        <RouterLink class="jump-card" to="/knowledge">
-          <strong>进入知识库页</strong>
-          <span>创建知识库、上传文件、触发索引并做检索测试。</span>
+        <RouterLink class="entry-pill" to="/admin/knowledge">
+          <strong>知识库管理</strong>
+          <span>创建知识库、上传文件、索引与检索测试。</span>
         </RouterLink>
-        <RouterLink class="jump-card" to="/mcp">
-          <strong>进入 MCP 页</strong>
-          <span>管理 MCP Server、测试连通性并同步可用工具快照。</span>
+        <RouterLink class="entry-pill" to="/admin/mcp">
+          <strong>MCP 管理</strong>
+          <span>维护 MCP Server、连通性测试与工具快照。</span>
         </RouterLink>
       </div>
+
+      <p class="entry-note">后台页保留必要的协同入口，但不再承担前台导航角色。</p>
     </el-card>
 
     <el-card class="status-card" shadow="never">
@@ -188,13 +189,13 @@ onMounted(loadHealth)
   color: #425466;
 }
 
-.jump-grid {
+.entry-strip {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
 
-.jump-card {
+.entry-pill {
   display: grid;
   gap: 8px;
   padding: 18px;
@@ -206,20 +207,27 @@ onMounted(loadHealth)
     border-color 160ms ease;
 }
 
-.jump-card:hover {
+.entry-pill:hover {
   transform: translateY(-1px);
   border-color: rgba(31, 78, 121, 0.45);
 }
 
-.jump-card strong {
+.entry-pill strong {
   color: #0f172a;
 }
 
-.jump-card span,
+.entry-pill span,
 .meta-inline,
 .meta-row {
   color: #64748b;
   font-size: 13px;
+}
+
+.entry-note {
+  margin: 16px 0 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .status-grid {
@@ -249,7 +257,7 @@ onMounted(loadHealth)
 }
 
 @media (max-width: 960px) {
-  .jump-grid,
+  .entry-strip,
   .status-grid {
     grid-template-columns: 1fr;
   }

@@ -28,8 +28,9 @@ public class McpToolRuntimeService {
      * 2. 可暴露给模型的 tool 以 `mcp_tool_snapshot.enabled` 为准
      * 3. tool 的执行器仍然完全使用 LangChain4j 官方 `McpToolProvider`
      *
-     * 当前先收敛为“所有启用的 server + 所有启用的工具快照”都会参与装配，
-     * 会话级 `conversation_mcp_binding` 留到下一步再接入。
+     * 当前服务只负责把“上游已经筛选好的 MCP Server 集合”转换成运行时 Tool。
+     * 会话级绑定与请求覆盖的优先级已在更上游的 `ChatExecutionSpec` 中收口，
+     * 这里不再假定所有启用的 server 都默认可见。
      */
     private static final int DEFAULT_SERVER_LIMIT = 100;
     private static final int DEFAULT_TOOL_LIMIT = 300;
@@ -48,8 +49,13 @@ public class McpToolRuntimeService {
         this.mcpClientFactory = mcpClientFactory;
     }
 
-    public McpToolRuntime openRuntime(Long conversationId, String userMessage) {
+    public McpToolRuntime openRuntime(Long conversationId, String userMessage, List<Long> enabledServerIds) {
+        if (enabledServerIds == null || enabledServerIds.isEmpty()) {
+            return McpToolRuntime.empty();
+        }
+
         List<McpServerDO> candidateServers = mcpServerMapper.selectList(null, 1, null, DEFAULT_SERVER_LIMIT).stream()
+                .filter(server -> enabledServerIds.contains(server.getId()))
                 .filter(server -> !"UNHEALTHY".equalsIgnoreCase(server.getHealthStatus()))
                 .toList();
         if (candidateServers.isEmpty()) {

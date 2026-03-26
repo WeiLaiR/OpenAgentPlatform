@@ -108,10 +108,6 @@ const indexedKnowledgeFiles = computed(() => {
   return knowledgeFiles.value.filter((item) => item.indexStatus === 'INDEXED')
 })
 
-const activeSegmentFile = computed(() => {
-  return knowledgeFiles.value.find((item) => item.id === selectedSegmentFileId.value) ?? null
-})
-
 const retrieveScopeNames = computed(() => {
   return retrieveForm.knowledgeBaseIds
     .map((id) => knowledgeBaseNameMap.value.get(id))

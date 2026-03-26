@@ -17,11 +17,13 @@ public record ChatExecutionSpec(
         ChatMode mode,
         boolean streaming,
         boolean memoryEnabled,
-        List<Long> knowledgeBaseIds
+        List<Long> knowledgeBaseIds,
+        List<Long> mcpServerIds
 ) {
 
     public ChatExecutionSpec {
         knowledgeBaseIds = knowledgeBaseIds == null ? List.of() : List.copyOf(knowledgeBaseIds);
+        mcpServerIds = mcpServerIds == null ? List.of() : List.copyOf(mcpServerIds);
     }
 
     public boolean ragEnabled() {

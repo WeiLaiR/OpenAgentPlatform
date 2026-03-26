@@ -1,19 +1,29 @@
 package com.weilair.openagent.conversation.service;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import com.weilair.openagent.ai.config.OpenAgentMemoryProperties;
 import com.weilair.openagent.chat.model.ChatMode;
 import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.conversation.exception.ConversationNotFoundException;
 import com.weilair.openagent.conversation.model.ConversationDO;
+import com.weilair.openagent.conversation.model.ConversationKbBindingDO;
+import com.weilair.openagent.conversation.model.ConversationMcpBindingDO;
 import com.weilair.openagent.conversation.model.ConversationMessageDO;
+import com.weilair.openagent.conversation.persistence.mapper.ConversationKbBindingMapper;
 import com.weilair.openagent.conversation.persistence.mapper.ConversationMapper;
+import com.weilair.openagent.conversation.persistence.mapper.ConversationMcpBindingMapper;
 import com.weilair.openagent.conversation.persistence.mapper.ConversationMessageMapper;
+import com.weilair.openagent.knowledge.service.KnowledgeBaseService;
+import com.weilair.openagent.mcp.service.McpServerService;
+import com.weilair.openagent.memory.service.ConversationMemoryService;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.dto.ConversationCreateRequest;
 import com.weilair.openagent.web.dto.ConversationSettingsUpdateRequest;
+import com.weilair.openagent.web.vo.ConversationMemoryClearVO;
 import com.weilair.openagent.web.vo.ConversationMessageVO;
 import com.weilair.openagent.web.vo.ConversationVO;
 import org.springframework.stereotype.Service;
@@ -30,16 +40,31 @@ public class ConversationService {
 
     private final OpenAgentMemoryProperties memoryProperties;
     private final ConversationMapper conversationMapper;
+    private final ConversationKbBindingMapper conversationKbBindingMapper;
+    private final ConversationMcpBindingMapper conversationMcpBindingMapper;
     private final ConversationMessageMapper conversationMessageMapper;
+    private final KnowledgeBaseService knowledgeBaseService;
+    private final McpServerService mcpServerService;
+    private final ConversationMemoryService conversationMemoryService;
 
     public ConversationService(
             OpenAgentMemoryProperties memoryProperties,
             ConversationMapper conversationMapper,
-            ConversationMessageMapper conversationMessageMapper
+            ConversationKbBindingMapper conversationKbBindingMapper,
+            ConversationMcpBindingMapper conversationMcpBindingMapper,
+            ConversationMessageMapper conversationMessageMapper,
+            KnowledgeBaseService knowledgeBaseService,
+            McpServerService mcpServerService,
+            ConversationMemoryService conversationMemoryService
     ) {
         this.memoryProperties = memoryProperties;
         this.conversationMapper = conversationMapper;
+        this.conversationKbBindingMapper = conversationKbBindingMapper;
+        this.conversationMcpBindingMapper = conversationMcpBindingMapper;
         this.conversationMessageMapper = conversationMessageMapper;
+        this.knowledgeBaseService = knowledgeBaseService;
+        this.mcpServerService = mcpServerService;
+        this.conversationMemoryService = conversationMemoryService;
     }
 
     /**
@@ -56,7 +81,7 @@ public class ConversationService {
         conversation.setModeCode(resolveModeCode(conversation.getEnableRag(), conversation.getEnableAgent()));
         conversation.setStatus(1);
         conversationMapper.insert(conversation);
-        return toConversationVO(requireConversation(conversation.getId()));
+        return toConversationVO(resolveSettingsSnapshot(conversation.getId()));
     }
 
     /**
@@ -90,8 +115,13 @@ public class ConversationService {
 
     public List<ConversationVO> listConversations() {
         return conversationMapper.selectRecent(DEFAULT_LIST_LIMIT).stream()
+                .map(this::resolveSettingsSnapshot)
                 .map(this::toConversationVO)
                 .toList();
+    }
+
+    public ConversationVO getSettings(Long conversationId) {
+        return toConversationVO(resolveSettingsSnapshot(conversationId));
     }
 
     public List<ConversationMessageVO> listMessages(Long conversationId) {
@@ -102,23 +132,44 @@ public class ConversationService {
     }
 
     /**
-     * 当前会话 settings 先只开放模式开关更新。
-     * 前端切换 RAG / Agent 后需要把持久配置同步回 conversation，
-     * 否则请求结束后重新拉取会话列表时会被旧值覆盖。
+     * 会话 settings 接口按“完整快照覆盖”工作：
+     * 由 `conversation`、`conversation_kb_binding`、`conversation_mcp_binding`
+     * 共同承接当前会话的默认模式、memory、知识库和 MCP 绑定。
      */
     @Transactional
     public ConversationVO updateSettings(Long conversationId, ConversationSettingsUpdateRequest request) {
-        ConversationDO conversation = requireConversation(conversationId);
-        Boolean enableRag = request.enableRag() != null ? request.enableRag() : conversation.getEnableRag();
-        Boolean enableAgent = request.enableAgent() != null ? request.enableAgent() : conversation.getEnableAgent();
+        ConversationSettingsSnapshot currentSnapshot = resolveSettingsSnapshot(conversationId);
+        Boolean enableRag = request.enableRag() != null ? request.enableRag() : currentSnapshot.enableRag();
+        Boolean enableAgent = request.enableAgent() != null ? request.enableAgent() : currentSnapshot.enableAgent();
+        Boolean memoryEnabled = request.memoryEnabled() != null ? request.memoryEnabled() : currentSnapshot.memoryEnabled();
+        List<Long> knowledgeBaseIds = request.knowledgeBaseIds() != null
+                ? normalizeKnowledgeBaseIds(request.knowledgeBaseIds())
+                : currentSnapshot.knowledgeBaseIds();
+        List<Long> mcpServerIds = request.mcpServerIds() != null
+                ? normalizeMcpServerIds(request.mcpServerIds())
+                : currentSnapshot.mcpServerIds();
 
         conversationMapper.updateSettings(
                 conversationId,
                 enableRag,
                 enableAgent,
+                memoryEnabled,
                 resolveModeCode(enableRag, enableAgent)
         );
-        return toConversationVO(requireConversation(conversationId));
+        if (request.knowledgeBaseIds() != null) {
+            replaceKnowledgeBaseBindings(conversationId, knowledgeBaseIds);
+        }
+        if (request.mcpServerIds() != null) {
+            replaceMcpServerBindings(conversationId, mcpServerIds);
+        }
+        return toConversationVO(resolveSettingsSnapshot(conversationId));
+    }
+
+    @Transactional
+    public ConversationMemoryClearVO clearMemory(Long conversationId) {
+        requireConversation(conversationId);
+        conversationMemoryService.clearMemory(conversationId);
+        return new ConversationMemoryClearVO(conversationId, Boolean.TRUE);
     }
 
     /**
@@ -178,13 +229,32 @@ public class ConversationService {
         conversationMapper.updateLastMessageAt(conversationId, LocalDateTime.now());
     }
 
-    private ConversationVO toConversationVO(ConversationDO conversation) {
+    public ConversationSettingsSnapshot resolveSettingsSnapshot(Long conversationId) {
+        return resolveSettingsSnapshot(requireConversation(conversationId));
+    }
+
+    public ConversationSettingsSnapshot resolveSettingsSnapshot(ConversationDO conversation) {
+        return new ConversationSettingsSnapshot(
+                conversation,
+                Boolean.TRUE.equals(conversation.getEnableRag()),
+                Boolean.TRUE.equals(conversation.getEnableAgent()),
+                Boolean.TRUE.equals(conversation.getMemoryEnabled()),
+                normalizeIds(conversationKbBindingMapper.selectSelectedKnowledgeBaseIds(conversation.getId())),
+                normalizeIds(conversationMcpBindingMapper.selectSelectedServerIds(conversation.getId()))
+        );
+    }
+
+    private ConversationVO toConversationVO(ConversationSettingsSnapshot snapshot) {
+        ConversationDO conversation = snapshot.conversation();
         return new ConversationVO(
                 conversation.getId(),
                 conversation.getTitle(),
                 conversation.getModeCode(),
-                conversation.getEnableRag(),
-                conversation.getEnableAgent(),
+                snapshot.enableRag(),
+                snapshot.enableAgent(),
+                snapshot.memoryEnabled(),
+                snapshot.knowledgeBaseIds(),
+                snapshot.mcpServerIds(),
                 resolveStatusLabel(conversation.getStatus()),
                 TimeUtils.toEpochMillis(conversation.getLastMessageAt()),
                 TimeUtils.toEpochMillis(conversation.getCreatedAt()),
@@ -214,6 +284,68 @@ public class ConversationService {
             return "新会话";
         }
         return fallback.length() > 40 ? fallback.substring(0, 40) : fallback;
+    }
+
+    private List<Long> normalizeKnowledgeBaseIds(List<Long> knowledgeBaseIds) {
+        List<Long> normalized = normalizeIds(knowledgeBaseIds);
+        normalized.forEach(knowledgeBaseService::requireKnowledgeBase);
+        return normalized;
+    }
+
+    private List<Long> normalizeMcpServerIds(List<Long> mcpServerIds) {
+        List<Long> normalized = normalizeIds(mcpServerIds);
+        normalized.forEach(mcpServerService::requireServer);
+        return normalized;
+    }
+
+    private List<Long> normalizeIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+
+        List<Long> normalized = new ArrayList<>();
+        for (Long id : ids) {
+            if (id != null && normalized.stream().noneMatch(existing -> Objects.equals(existing, id))) {
+                normalized.add(id);
+            }
+        }
+        return List.copyOf(normalized);
+    }
+
+    private void replaceKnowledgeBaseBindings(Long conversationId, List<Long> knowledgeBaseIds) {
+        conversationKbBindingMapper.deleteByConversationId(conversationId);
+        if (knowledgeBaseIds.isEmpty()) {
+            return;
+        }
+
+        List<ConversationKbBindingDO> bindings = knowledgeBaseIds.stream()
+                .map(knowledgeBaseId -> {
+                    ConversationKbBindingDO binding = new ConversationKbBindingDO();
+                    binding.setConversationId(conversationId);
+                    binding.setKnowledgeBaseId(knowledgeBaseId);
+                    binding.setSelected(Boolean.TRUE);
+                    return binding;
+                })
+                .toList();
+        conversationKbBindingMapper.insertBatch(bindings);
+    }
+
+    private void replaceMcpServerBindings(Long conversationId, List<Long> mcpServerIds) {
+        conversationMcpBindingMapper.deleteByConversationId(conversationId);
+        if (mcpServerIds.isEmpty()) {
+            return;
+        }
+
+        List<ConversationMcpBindingDO> bindings = mcpServerIds.stream()
+                .map(serverId -> {
+                    ConversationMcpBindingDO binding = new ConversationMcpBindingDO();
+                    binding.setConversationId(conversationId);
+                    binding.setMcpServerId(serverId);
+                    binding.setSelected(Boolean.TRUE);
+                    return binding;
+                })
+                .toList();
+        conversationMcpBindingMapper.insertBatch(bindings);
     }
 
     private String resolveModeCode(Boolean enableRag, Boolean enableAgent) {

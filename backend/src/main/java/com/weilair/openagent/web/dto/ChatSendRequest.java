@@ -12,6 +12,8 @@ public record ChatSendRequest(
         String message,
         Boolean enableRag,
         Boolean enableAgent,
-        List<Long> knowledgeBaseIds
+        Boolean memoryEnabled,
+        List<Long> knowledgeBaseIds,
+        List<Long> mcpServerIds
 ) {
 }
