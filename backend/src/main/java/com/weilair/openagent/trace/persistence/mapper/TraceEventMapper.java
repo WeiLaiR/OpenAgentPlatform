@@ -3,6 +3,7 @@ package com.weilair.openagent.trace.persistence.mapper;
 import java.util.List;
 
 import com.weilair.openagent.trace.model.TraceEventDO;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Options;
@@ -56,4 +57,10 @@ public interface TraceEventMapper {
             ORDER BY created_at ASC, id ASC
             """)
     List<TraceEventDO> selectByRequestId(@Param("requestId") String requestId);
+
+    @Delete("""
+            DELETE FROM trace_event
+            WHERE conversation_id = #{conversationId}
+            """)
+    int deleteByConversationId(@Param("conversationId") Long conversationId);
 }

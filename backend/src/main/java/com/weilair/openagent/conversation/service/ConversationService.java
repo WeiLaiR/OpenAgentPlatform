@@ -19,7 +19,11 @@ import com.weilair.openagent.conversation.persistence.mapper.ConversationMcpBind
 import com.weilair.openagent.conversation.persistence.mapper.ConversationMessageMapper;
 import com.weilair.openagent.knowledge.service.KnowledgeBaseService;
 import com.weilair.openagent.mcp.service.McpServerService;
+import com.weilair.openagent.memory.model.ChatMemorySessionDO;
+import com.weilair.openagent.memory.persistence.mapper.ChatMemoryMessageMapper;
+import com.weilair.openagent.memory.persistence.mapper.ChatMemorySessionMapper;
 import com.weilair.openagent.memory.service.ConversationMemoryService;
+import com.weilair.openagent.trace.persistence.mapper.TraceEventMapper;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.dto.ConversationCreateRequest;
 import com.weilair.openagent.web.dto.ConversationSettingsUpdateRequest;
@@ -46,6 +50,9 @@ public class ConversationService {
     private final KnowledgeBaseService knowledgeBaseService;
     private final McpServerService mcpServerService;
     private final ConversationMemoryService conversationMemoryService;
+    private final ChatMemorySessionMapper chatMemorySessionMapper;
+    private final ChatMemoryMessageMapper chatMemoryMessageMapper;
+    private final TraceEventMapper traceEventMapper;
 
     public ConversationService(
             OpenAgentMemoryProperties memoryProperties,
@@ -55,7 +62,10 @@ public class ConversationService {
             ConversationMessageMapper conversationMessageMapper,
             KnowledgeBaseService knowledgeBaseService,
             McpServerService mcpServerService,
-            ConversationMemoryService conversationMemoryService
+            ConversationMemoryService conversationMemoryService,
+            ChatMemorySessionMapper chatMemorySessionMapper,
+            ChatMemoryMessageMapper chatMemoryMessageMapper,
+            TraceEventMapper traceEventMapper
     ) {
         this.memoryProperties = memoryProperties;
         this.conversationMapper = conversationMapper;
@@ -65,6 +75,9 @@ public class ConversationService {
         this.knowledgeBaseService = knowledgeBaseService;
         this.mcpServerService = mcpServerService;
         this.conversationMemoryService = conversationMemoryService;
+        this.chatMemorySessionMapper = chatMemorySessionMapper;
+        this.chatMemoryMessageMapper = chatMemoryMessageMapper;
+        this.traceEventMapper = traceEventMapper;
     }
 
     /**
@@ -93,15 +106,21 @@ public class ConversationService {
             return requireConversation(request.conversationId());
         }
 
+        List<Long> knowledgeBaseIds = normalizeKnowledgeBaseIds(request.knowledgeBaseIds());
+        List<Long> mcpServerIds = normalizeMcpServerIds(request.mcpServerIds());
         ConversationDO conversation = new ConversationDO();
         conversation.setUserId(DEFAULT_USER_ID);
         conversation.setTitle(resolveTitle(null, request.message()));
         conversation.setEnableRag(Boolean.TRUE.equals(request.enableRag()));
         conversation.setEnableAgent(Boolean.TRUE.equals(request.enableAgent()));
-        conversation.setMemoryEnabled(Boolean.TRUE.equals(memoryProperties.getDefaultEnabled()));
+        conversation.setMemoryEnabled(request.memoryEnabled() != null
+                ? request.memoryEnabled()
+                : Boolean.TRUE.equals(memoryProperties.getDefaultEnabled()));
         conversation.setModeCode(resolveModeCode(conversation.getEnableRag(), conversation.getEnableAgent()));
         conversation.setStatus(1);
         conversationMapper.insert(conversation);
+        replaceKnowledgeBaseBindings(conversation.getId(), knowledgeBaseIds);
+        replaceMcpServerBindings(conversation.getId(), mcpServerIds);
         return requireConversation(conversation.getId());
     }
 
@@ -170,6 +189,27 @@ public class ConversationService {
         requireConversation(conversationId);
         conversationMemoryService.clearMemory(conversationId);
         return new ConversationMemoryClearVO(conversationId, Boolean.TRUE);
+    }
+
+    /**
+     * 当前删除策略先采用物理删除，确保聊天页的历史列表不会残留空壳会话。
+     * 由于当前表结构没有建立数据库级联外键，这里由 service 层统一清理会话消息、Trace、会话绑定和 Memory。
+     */
+    @Transactional
+    public void deleteConversation(Long conversationId) {
+        requireConversation(conversationId);
+
+        ChatMemorySessionDO memorySession = chatMemorySessionMapper.selectByConversationId(conversationId);
+        if (memorySession != null) {
+            chatMemoryMessageMapper.deleteByMemorySessionId(memorySession.getId());
+            chatMemorySessionMapper.deleteByConversationId(conversationId);
+        }
+
+        traceEventMapper.deleteByConversationId(conversationId);
+        conversationMessageMapper.deleteByConversationId(conversationId);
+        conversationKbBindingMapper.deleteByConversationId(conversationId);
+        conversationMcpBindingMapper.deleteByConversationId(conversationId);
+        conversationMapper.deleteById(conversationId);
     }
 
     /**

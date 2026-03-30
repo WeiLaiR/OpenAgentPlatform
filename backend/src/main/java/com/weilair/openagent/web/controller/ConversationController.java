@@ -10,6 +10,7 @@ import com.weilair.openagent.web.vo.ConversationMemoryClearVO;
 import com.weilair.openagent.web.vo.ConversationMessageVO;
 import com.weilair.openagent.web.vo.ConversationVO;
 import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -59,5 +60,11 @@ public class ConversationController {
     @PostMapping("/{conversationId}/memory/clear")
     public ApiResponse<ConversationMemoryClearVO> clearMemory(@PathVariable Long conversationId) {
         return ApiResponse.success(conversationService.clearMemory(conversationId));
+    }
+
+    @DeleteMapping("/{conversationId}")
+    public ApiResponse<Boolean> deleteConversation(@PathVariable Long conversationId) {
+        conversationService.deleteConversation(conversationId);
+        return ApiResponse.success(Boolean.TRUE);
     }
 }

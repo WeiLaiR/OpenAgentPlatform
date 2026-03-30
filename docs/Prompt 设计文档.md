@@ -460,6 +460,86 @@ MCP 工具使用提示 Prompt
 **先代码里维护模板常量**。
  因为你现在还在快速迭代，写数据库模板管理反而会增加复杂度。
 
+### 当前主链路代码落地建议（2026-03-30）
+
+如果要把 Prompt 真正固定到当前主链路代码里，建议先收口到下面几个明确落点，而不是继续让 Prompt 分散在不同运行时里各写一段：
+
+#### 1. Prompt 先收口成代码模板目录
+
+第一版不要做 Prompt 管理后台，建议先在后端代码里集中维护：
+
+- `chat/prompt/PromptTemplateKey`
+- `chat/prompt/PromptTemplateCatalog`
+- `chat/prompt/PromptAssembly`
+
+目标不是发明一套复杂 DSL，而是把“当前有哪些 Prompt 块、每块负责什么、最终这轮拼了哪些块”固定下来。
+
+#### 2. 第一版固定 5 块 Prompt
+
+当前主链路建议优先固定这 5 块，而不是一开始把所有 Prompt 变体都落完：
+
+- `system-base`
+- `rag-context`
+- `agent-tool-policy`
+- `mcp-tool-selection`
+- `answer-format`
+
+`chat-base` 可以继续保留在文档里，但第一版不一定要先单独做成代码块；纯聊天模式先复用 `system-base + answer-format` 也能成立。
+
+#### 3. `ChatContextAssembler` 作为统一装配入口
+
+当前代码里：
+
+- `ChatContextAssembler` 还在手工拼 RAG `SystemMessage`
+- `RagRuntimeResolver` 里还保留了一段局部 `PromptTemplate`
+- Agent 路径目前主要是 `@UserMessage("{{message}}")`
+
+第一版建议把 Prompt 装配职责统一收敛到 `ChatContextAssembler`：
+
+- 负责组装系统层 Prompt
+- 负责组装模式层 Prompt
+- 负责承接会话层和请求层补充
+- 负责产出“本轮 Prompt 由哪些块组成”的摘要
+
+这样后面无论同步、流式、RAG 还是 Agent，都不再各自偷偷拼字符串。
+
+#### 4. LangChain4j 官方能力优先使用
+
+Prompt 固化这件事本身不需要绕开 LangChain4j 主线，第一版建议继续优先使用：
+
+- `SystemMessage`
+- `PromptTemplate`
+- `DefaultRetrievalAugmentor`
+- `AI Services`
+
+项目自定义部分只保留在“Prompt 模板目录、Prompt 组合结果、Trace 摘要”这层，不额外发明新的模型调用抽象。
+
+#### 5. 当前落地进展与 Trace 可见性
+
+当前主链路已经按下面顺序落地：
+
+1. 已把 5 块 Prompt 模板收口到 `PromptTemplateKey / PromptTemplateCatalog / PromptAssembly`。
+2. 已让 `ChatContextAssembler` 产出统一的 Prompt 组合结果，并覆盖非 Agent 主链路。
+3. 已把 `RagRuntimeResolver` 的局部 `PromptTemplate` 回收到统一 Prompt 目录。
+4. 已给 Agent 路径补上 `system-base + agent-tool-policy + mcp-tool-selection + answer-format` 的正式注入入口。
+5. 已补上 `PROMPT_ASSEMBLY_RESOLVED` trace 事件，当前 Trace / 调试视图可以看到：
+   - 本轮最终使用了哪些 Prompt 块
+   - Prompt 来自 `ChatContextAssembler` 还是 `AgentAiServiceFactory`
+   - 各块变量的结构化摘要
+   - 非 Agent 路径最终请求是否按 `system -> history -> user` 组织
+
+这里仍然保持一个重要边界：
+
+- Trace 默认只暴露 Prompt 组成摘要，不直接暴露整段 Prompt 原文。
+- `PromptAssembly.summary()` 里的变量信息只保留长度、行数、集合大小等摘要，避免把完整 RAG 片段或系统提示全文无控制暴露到普通页面。
+
+#### 6. 第一版验收重点
+
+- 同一模式下回答风格和边界更稳定
+- RAG 模式明确优先依赖检索结果
+- Agent 模式明确工具使用边界
+- 后续定位问题时，能区分是 Prompt 组合问题、RAG 问题还是工具问题
+
 ------
 
 ## 9. Prompt 调优优先级建议
@@ -506,14 +586,15 @@ MCP 工具使用提示 Prompt
 
 ## 11. 第一版最小 Prompt 集合
 
-如果你现在想立刻开工，只要先落这 4 个就够了：
+如果你现在想立刻开工，建议先把下面 5 个固定到主链路代码里：
 
 - 全局系统 Prompt
 - RAG Prompt
 - Tool 调用约束 Prompt
+- MCP 工具选择 Prompt
 - 最终回答格式 Prompt
 
-这 4 个已经足够支撑：
+这 5 个已经足够支撑：
 
 - 纯聊天
 - RAG

@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { MoreFilled, Plus, Setting } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ChatDotRound, CopyDocument, Delete, MoreFilled, Plus, Setting } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
   clearConversationMemory,
-  createConversation,
+  deleteConversation,
   getConversationSettings,
   listConversationMessages,
   listConversations,
@@ -26,6 +26,7 @@ import { RequestError } from '@/api/http'
 import { listKnowledgeBases, type KnowledgeBase } from '@/api/knowledge'
 import { listMcpServers, type McpServer } from '@/api/mcp'
 import { getTraceDetail, type TraceEvent } from '@/api/trace'
+import { renderMarkdownToHtml } from '@/utils/markdown'
 
 const DEFAULT_MEMORY_ENABLED = true
 
@@ -36,15 +37,19 @@ function createIdOverrideState() {
   }
 }
 
+function createDraftModeState() {
+  return {
+    enableRag: false,
+    enableAgent: false,
+    memoryEnabled: DEFAULT_MEMORY_ENABLED,
+  }
+}
+
 const chatInput = ref('')
 const chatLoading = ref(false)
 const chatError = ref('')
 const activeChatRequestId = ref('')
-const modeState = ref({
-  enableRag: false,
-  enableAgent: false,
-  memoryEnabled: DEFAULT_MEMORY_ENABLED,
-})
+const modeState = ref(createDraftModeState())
 const conversations = ref<Conversation[]>([])
 const messages = ref<ConversationMessage[]>([])
 const traces = ref<TraceEvent[]>([])
@@ -62,7 +67,7 @@ const selectedMcpServerIds = ref<number[]>([])
 const requestKnowledgeBaseOverride = ref(createIdOverrideState())
 const requestMcpServerOverride = ref(createIdOverrideState())
 const memoryClearing = ref(false)
-const traceFilter = ref<'ALL' | 'RAG' | 'MODEL' | 'TOOL' | 'FAILED'>('ALL')
+const traceFilter = ref<'ALL' | 'PROMPT' | 'RAG' | 'MODEL' | 'TOOL' | 'FAILED'>('ALL')
 const traceExpandedIds = ref<number[]>([])
 const settingsDrawerVisible = ref(false)
 const traceDialogVisible = ref(false)
@@ -76,6 +81,9 @@ let activeChatSource: EventSource | null = null
 let activeTraceSource: EventSource | null = null
 let thinkingTicker: number | null = null
 let chatScrollFrame: number | null = null
+let conversationTitleRefreshTimer: number | null = null
+const assistantMarkdownRenderTimers = new Map<number, number>()
+const assistantMarkdownLastRenderAt = new Map<number, number>()
 
 const selectedKnowledgeBases = computed(() => {
   return availableKnowledgeBases.value.filter((item) =>
@@ -125,6 +133,8 @@ const currentRoundSummary = computed(() => {
   const ragFinished = findLastTrace('RAG_RETRIEVAL_FINISHED')
   const modelStarted = findLastTrace('MODEL_REQUEST_STARTED')
   const finalCompleted = findLastTrace('FINAL_RESPONSE_COMPLETED')
+  const promptResolved = findLastTrace('PROMPT_ASSEMBLY_RESOLVED')
+  const promptPayload = promptResolved ? parseTracePayload(promptResolved.eventPayloadJson) : null
 
   const knowledgeBaseIds =
     readTraceNumericArray(ragStarted, 'knowledgeBaseIds') ??
@@ -133,6 +143,16 @@ const currentRoundSummary = computed(() => {
   const retrievedCount =
     readTraceNumber(ragSelected, 'count') ?? readTraceNumber(ragFinished, 'count') ?? 0
   const ragSnippetCount = readTraceNumber(modelStarted, 'ragSnippetCount') ?? retrievedCount
+  const promptKeys =
+    promptPayload && Array.isArray(promptPayload.promptKeys)
+      ? promptPayload.promptKeys.map((item) => String(item))
+      : []
+  const promptBlocks = readTraceNumber(promptResolved, 'blockCount') ?? promptKeys.length
+  const promptSource =
+    promptPayload && typeof promptPayload.promptSource === 'string'
+      ? promptPayload.promptSource
+      : '未装配'
+  const promptSummaryText = promptKeys.length > 0 ? promptKeys.join(' + ') : '未装配'
 
   let ragStatus = '未开启'
   if (modeState.value.enableRag || ragStarted || ragSelected || ragFinished || modelStarted) {
@@ -162,6 +182,9 @@ const currentRoundSummary = computed(() => {
     retrievedCount,
     ragStatus,
     requestStatus,
+    promptSummaryText,
+    promptBlocks,
+    promptSource,
   }
 })
 
@@ -200,22 +223,9 @@ async function loadConversations(preserveActive = true) {
     }
   }
 
-  const firstConversation = list.length > 0 ? list[0]! : null
-  if (firstConversation) {
-    await selectConversation(firstConversation.id)
-    return
+  if (activeConversationId.value) {
+    resetDraftConversation(false)
   }
-
-  activeConversationId.value = null
-  messages.value = []
-  selectedKnowledgeBaseIds.value = []
-  selectedMcpServerIds.value = []
-  modeState.value = {
-    enableRag: false,
-    enableAgent: false,
-    memoryEnabled: DEFAULT_MEMORY_ENABLED,
-  }
-  resetRequestOverrides()
 }
 
 async function loadKnowledgeOptions() {
@@ -267,28 +277,8 @@ async function loadMcpServerOptions() {
 }
 
 async function createNewConversation() {
-  const draftSettings = {
-    enableRag: modeState.value.enableRag,
-    enableAgent: modeState.value.enableAgent,
-    memoryEnabled: modeState.value.memoryEnabled,
-    knowledgeBaseIds: [...selectedKnowledgeBaseIds.value],
-    mcpServerIds: [...selectedMcpServerIds.value],
-  }
-  const conversation = await createConversation({
-    title: '新会话',
-    enableRag: draftSettings.enableRag,
-    enableAgent: draftSettings.enableAgent,
-  })
-  let persistedConversation = conversation
-  if (
-    draftSettings.memoryEnabled !== conversation.memoryEnabled ||
-    draftSettings.knowledgeBaseIds.length > 0 ||
-    draftSettings.mcpServerIds.length > 0
-  ) {
-    persistedConversation = await updateConversationSettings(conversation.id, draftSettings)
-  }
-  conversations.value = [persistedConversation, ...conversations.value]
-  await selectConversation(persistedConversation.id)
+  resetDraftConversation(true)
+  await focusChatInput()
 }
 
 async function focusChatInput() {
@@ -346,6 +336,11 @@ function handleChatHistoryScroll() {
 }
 
 async function handleConversationCommand(command: string, conversation: Conversation) {
+  if (command === 'delete') {
+    await handleDeleteConversation(conversation)
+    return
+  }
+
   if (command === 'copy-id') {
     try {
       await navigator.clipboard.writeText(String(conversation.id))
@@ -370,12 +365,50 @@ function handleConversationDropdownCommand(
   void handleConversationCommand(String(command), conversation)
 }
 
+async function handleDeleteConversation(conversation: Conversation) {
+  if (chatLoading.value && activeConversationId.value === conversation.id) {
+    ElMessage.warning('当前会话仍在生成中，请等待本轮完成后再删除。')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `你将删除“${conversation.title}”。删除后会同步清理该会话的聊天记录、Trace 与 Memory 数据，当前实现为物理删除，操作后无法恢复。`,
+      '删除会话',
+      {
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        customClass: 'conversation-delete-dialog',
+        confirmButtonClass: 'conversation-delete-dialog__confirm',
+        cancelButtonClass: 'conversation-delete-dialog__cancel',
+      },
+    )
+  } catch {
+    return
+  }
+
+  try {
+    await deleteConversation(conversation.id)
+
+    if (activeConversationId.value === conversation.id) {
+      resetDraftConversation(true)
+    }
+
+    await loadConversations(false)
+    await focusChatInput()
+    ElMessage.success('会话已删除。')
+  } catch (error) {
+    chatError.value = error instanceof RequestError ? error.message : '删除会话失败。'
+  }
+}
+
 async function selectConversation(conversationId: number) {
   activeConversationId.value = conversationId
   activeChatRequestId.value = ''
   traces.value = []
   traceError.value = ''
   closeStreams()
+  resetAssistantMarkdownRenderState()
   resetRequestOverrides()
 
   const [records, conversation] = await Promise.all([
@@ -387,6 +420,27 @@ async function selectConversation(conversationId: number) {
   messages.value = normalizeMessages(records)
   await focusChatInput()
   keepChatHistoryPinned(true)
+}
+
+function resetDraftConversation(clearComposer: boolean) {
+  activeConversationId.value = null
+  activeChatRequestId.value = ''
+  traces.value = []
+  traceError.value = ''
+  closeStreams()
+  resetAssistantMarkdownRenderState()
+  messages.value = []
+  modeState.value = createDraftModeState()
+  selectedKnowledgeBaseIds.value = []
+  selectedMcpServerIds.value = []
+  resetRequestOverrides()
+  showScrollToLatest.value = false
+  chatAutoScrollPinned.value = true
+
+  if (clearComposer) {
+    chatInput.value = ''
+    chatError.value = ''
+  }
 }
 
 function handleComposerEnter() {
@@ -434,6 +488,7 @@ async function handleSendSync() {
   chatLoading.value = true
   chatError.value = ''
   traceError.value = ''
+  const shouldRefreshGeneratedTitle = activeConversationId.value === null
 
   try {
     await persistActiveConversationSettings()
@@ -441,6 +496,9 @@ async function handleSendSync() {
     activeChatRequestId.value = answer.requestId ?? ''
     chatInput.value = ''
     await refreshAfterRound(answer.conversationId, answer.requestId ?? null)
+    if (shouldRefreshGeneratedTitle && answer.conversationId) {
+      scheduleGeneratedTitleRefresh(answer.conversationId)
+    }
   } catch (error) {
     chatError.value = error instanceof RequestError ? error.message : '同步聊天调用失败。'
   } finally {
@@ -458,6 +516,7 @@ async function handleSend() {
   chatLoading.value = true
   chatError.value = ''
   traceError.value = ''
+  const shouldRefreshGeneratedTitle = activeConversationId.value === null
   let optimisticUserMessageId: number | null = null
   let optimisticAssistantMessageId: number | null = null
 
@@ -511,6 +570,9 @@ async function handleSend() {
     }, 0)
     await chatStreamPromise
     await refreshAfterRound(accepted.conversationId, accepted.requestId)
+    if (shouldRefreshGeneratedTitle && accepted.conversationId) {
+      scheduleGeneratedTitleRefresh(accepted.conversationId)
+    }
   } catch (error) {
     removeOptimisticMessages(
       [optimisticUserMessageId, optimisticAssistantMessageId].filter(
@@ -538,6 +600,7 @@ function validateBeforeSend() {
 }
 
 function buildChatRequest(message: string): ChatSendRequest {
+  const isDraftConversation = !activeConversationId.value
   const request: ChatSendRequest = {
     conversationId: activeConversationId.value ?? undefined,
     message,
@@ -545,20 +608,20 @@ function buildChatRequest(message: string): ChatSendRequest {
     enableAgent: modeState.value.enableAgent,
   }
 
-  if (!activeConversationId.value) {
+  if (isDraftConversation) {
     request.memoryEnabled = modeState.value.memoryEnabled
   }
 
   if (requestKnowledgeBaseOverride.value.enabled) {
     request.knowledgeBaseIds = [...requestKnowledgeBaseOverride.value.ids]
-  } else if (!modeState.value.enableRag) {
-    request.knowledgeBaseIds = []
+  } else if (isDraftConversation) {
+    request.knowledgeBaseIds = [...selectedKnowledgeBaseIds.value]
   }
 
   if (requestMcpServerOverride.value.enabled) {
     request.mcpServerIds = [...requestMcpServerOverride.value.ids]
-  } else if (!modeState.value.enableAgent) {
-    request.mcpServerIds = []
+  } else if (isDraftConversation) {
+    request.mcpServerIds = [...selectedMcpServerIds.value]
   }
 
   return request
@@ -642,23 +705,27 @@ function appendAssistantChunk(assistantMessageId: number, streamRequestId: strin
     existing.content = `${existing.content ?? ''}${content}`
     existing.uiState = 'streaming'
     existing.progressMessage = undefined
+    scheduleAssistantMarkdownRender(existing)
     return
+  }
+
+  const assistantMessage: ConversationMessage = {
+    id: -Date.now(),
+    conversationId: activeConversationId.value ?? 0,
+    roleCode: 'ASSISTANT',
+    messageType: 'TEXT',
+    content,
+    requestId: streamRequestId,
+    finishReason: null,
+    createdAt: Date.now(),
+    uiState: 'streaming',
   }
 
   messages.value = [
     ...messages.value,
-    {
-      id: -Date.now(),
-      conversationId: activeConversationId.value ?? 0,
-      roleCode: 'ASSISTANT',
-      messageType: 'TEXT',
-      content,
-      requestId: streamRequestId,
-      finishReason: null,
-      createdAt: Date.now(),
-      uiState: 'streaming',
-    },
+    assistantMessage,
   ]
+  scheduleAssistantMarkdownRender(assistantMessage)
 }
 
 function completeAssistantMessage(assistantMessageId: number, streamRequestId: string, answer: string) {
@@ -669,6 +736,7 @@ function completeAssistantMessage(assistantMessageId: number, streamRequestId: s
     target.finishReason = 'stop'
     target.uiState = 'done'
     target.progressMessage = undefined
+    renderAssistantMarkdownImmediately(target)
   }
 }
 
@@ -678,6 +746,7 @@ function markAssistantMessageError(assistantMessageId: number, streamRequestId: 
     target.requestId = streamRequestId
     target.content = '请求失败。'
     target.uiState = 'error'
+    renderAssistantMarkdownImmediately(target)
   }
 }
 
@@ -699,6 +768,76 @@ function updateAssistantProgress(
   if (!target.thinkingStartedAt) {
     target.thinkingStartedAt = Date.now() - payload.elapsedMillis
   }
+}
+
+function clearAssistantMarkdownRenderTimer(messageId: number) {
+  const timer = assistantMarkdownRenderTimers.get(messageId)
+  if (timer !== undefined) {
+    window.clearTimeout(timer)
+    assistantMarkdownRenderTimers.delete(messageId)
+  }
+}
+
+function resetAssistantMarkdownRenderState() {
+  assistantMarkdownRenderTimers.forEach((timer) => window.clearTimeout(timer))
+  assistantMarkdownRenderTimers.clear()
+  assistantMarkdownLastRenderAt.clear()
+}
+
+function renderAssistantMarkdown(message: ConversationMessage) {
+  if (message.roleCode !== 'ASSISTANT') {
+    return
+  }
+
+  const latestMessage = messages.value.find((item) => item.id === message.id) ?? message
+  if (latestMessage.roleCode !== 'ASSISTANT') {
+    return
+  }
+
+  const markdown = latestMessage.content ?? ''
+  if (latestMessage.renderCacheKey === markdown) {
+    return
+  }
+
+  latestMessage.renderedContentHtml = markdown ? renderMarkdownToHtml(markdown) : ''
+  latestMessage.renderCacheKey = markdown
+  assistantMarkdownLastRenderAt.set(latestMessage.id, Date.now())
+}
+
+function renderAssistantMarkdownImmediately(message: ConversationMessage) {
+  if (message.roleCode !== 'ASSISTANT') {
+    return
+  }
+
+  clearAssistantMarkdownRenderTimer(message.id)
+  renderAssistantMarkdown(message)
+}
+
+function scheduleAssistantMarkdownRender(message: ConversationMessage) {
+  if (message.roleCode !== 'ASSISTANT') {
+    return
+  }
+
+  const renderInterval = 80
+  const lastRenderedAt = assistantMarkdownLastRenderAt.get(message.id) ?? 0
+  const waitMillis = Math.max(0, renderInterval - (Date.now() - lastRenderedAt))
+
+  if (waitMillis === 0) {
+    renderAssistantMarkdownImmediately(message)
+    return
+  }
+
+  if (assistantMarkdownRenderTimers.has(message.id)) {
+    return
+  }
+
+  // 流式阶段要保持增量可见，因此这里用节流而不是防抖；
+  // 否则 token 持续到来时会一直重置定时器，最终变成“结束后一次性打印”。
+  const timer = window.setTimeout(() => {
+    assistantMarkdownRenderTimers.delete(message.id)
+    renderAssistantMarkdown(message)
+  }, waitMillis)
+  assistantMarkdownRenderTimers.set(message.id, timer)
 }
 
 function updateConversationCache(conversation: Conversation) {
@@ -816,6 +955,21 @@ function closeStreams() {
   activeTraceSource = null
 }
 
+function scheduleGeneratedTitleRefresh(conversationId: number) {
+  if (conversationTitleRefreshTimer !== null) {
+    window.clearTimeout(conversationTitleRefreshTimer)
+  }
+
+  conversationTitleRefreshTimer = window.setTimeout(async () => {
+    conversationTitleRefreshTimer = null
+    await loadConversations()
+
+    if (activeConversationId.value === conversationId) {
+      await selectConversation(conversationId)
+    }
+  }, 1800)
+}
+
 async function refreshAfterRound(conversationId: number | null, chatRequestId: string | null) {
   await loadConversations()
 
@@ -852,6 +1006,9 @@ function normalizeMessages(records: ConversationMessage[]) {
   return records.map((item) => ({
     ...item,
     uiState: item.roleCode === 'ASSISTANT' ? ('done' as const) : undefined,
+    renderedContentHtml:
+      item.roleCode === 'ASSISTANT' && item.content ? renderMarkdownToHtml(item.content) : undefined,
+    renderCacheKey: item.roleCode === 'ASSISTANT' ? item.content : undefined,
   }))
 }
 
@@ -902,6 +1059,9 @@ function readTraceNumericArray(trace: TraceEvent | null, field: string) {
 }
 
 function traceTitle(trace: TraceEvent) {
+  if (trace.eventType === 'PROMPT_ASSEMBLY_RESOLVED') {
+    return 'Prompt 组成已固定'
+  }
   if (trace.eventType === 'RAG_RETRIEVAL_STARTED') {
     return '开始检索知识库'
   }
@@ -933,6 +1093,9 @@ function traceTitle(trace: TraceEvent) {
 }
 
 function traceDescription(trace: TraceEvent) {
+  if (trace.eventType === 'PROMPT_ASSEMBLY_RESOLVED') {
+    return '当前轮真正进入主链路的 Prompt 组成已经固定，可直接核对块来源、块数量和变量摘要。'
+  }
   if (trace.eventType === 'RAG_RETRIEVAL_STARTED') {
     return '当前请求已进入 RAG 检索阶段，准备按知识库分区做向量召回。'
   }
@@ -1004,6 +1167,29 @@ function traceFacts(trace: TraceEvent) {
     ]
   }
 
+  if (trace.eventType === 'PROMPT_ASSEMBLY_RESOLVED') {
+    const promptKeys = Array.isArray(payload.promptKeys) ? payload.promptKeys : []
+    const variableSummary =
+      payload.variableSummary && typeof payload.variableSummary === 'object'
+        ? (payload.variableSummary as Record<string, unknown>)
+        : {}
+    return [
+      { label: 'Prompt 来源', value: formatScalar(payload.promptSource) },
+      { label: '模式', value: formatScalar(payload.modeCode) },
+      { label: 'Prompt 块', value: promptKeys.length > 0 ? promptKeys.join(' + ') : '未记录' },
+      {
+        label: '变量摘要',
+        value:
+          Object.keys(variableSummary).length > 0 ? Object.keys(variableSummary).join('、') : '无变量块',
+      },
+      { label: 'System 消息数', value: formatScalar(payload.systemMessageCount) },
+      { label: '历史消息数', value: formatScalar(payload.historyMessageCount) },
+      { label: '请求消息数', value: formatScalar(payload.requestMessageCount) },
+      { label: '工具数', value: formatScalar(payload.toolCount) },
+      { label: '请求结构', value: formatScalar(payload.requestStructure) },
+    ]
+  }
+
   if (trace.eventType === 'CHAT_EXECUTION_SPEC_RESOLVED') {
     const knowledgeBaseIds = Array.isArray(payload.knowledgeBaseIds) ? payload.knowledgeBaseIds : []
     const mcpServerIds = Array.isArray(payload.mcpServerIds) ? payload.mcpServerIds : []
@@ -1072,6 +1258,7 @@ function selectedSegmentRefs(trace: TraceEvent) {
 
 function isStructuredTrace(trace: TraceEvent) {
   return [
+    'PROMPT_ASSEMBLY_RESOLVED',
     'RAG_RETRIEVAL_STARTED',
     'RAG_SEGMENTS_SELECTED',
     'RAG_RETRIEVAL_FINISHED',
@@ -1087,6 +1274,10 @@ function isStructuredTrace(trace: TraceEvent) {
 
 function isModelTrace(trace: TraceEvent) {
   return trace.eventType.startsWith('MODEL_') || trace.eventType.startsWith('FINAL_RESPONSE_')
+}
+
+function isPromptTrace(trace: TraceEvent) {
+  return trace.eventType.startsWith('PROMPT_') || trace.eventStage === 'PROMPT'
 }
 
 function isToolTrace(trace: TraceEvent) {
@@ -1106,6 +1297,9 @@ function shouldExpandTraceByDefault(trace: TraceEvent) {
 }
 
 function matchesTraceFilter(trace: TraceEvent) {
+  if (traceFilter.value === 'PROMPT') {
+    return isPromptTrace(trace)
+  }
   if (traceFilter.value === 'RAG') {
     return trace.eventType.startsWith('RAG_')
   }
@@ -1234,6 +1428,10 @@ onBeforeUnmount(() => {
   if (chatScrollFrame !== null) {
     window.cancelAnimationFrame(chatScrollFrame)
   }
+  if (conversationTitleRefreshTimer !== null) {
+    window.clearTimeout(conversationTitleRefreshTimer)
+  }
+  resetAssistantMarkdownRenderState()
   closeStreams()
 })
 </script>
@@ -1278,6 +1476,7 @@ onBeforeUnmount(() => {
 
               <el-dropdown
                 placement="bottom-end"
+                popper-class="conversation-item-dropdown"
                 trigger="click"
                 @command="handleConversationDropdownCommand(conversation, $event)"
               >
@@ -1289,6 +1488,13 @@ onBeforeUnmount(() => {
                     <el-dropdown-item command="open">打开会话</el-dropdown-item>
                     <el-dropdown-item command="settings">打开会话配置</el-dropdown-item>
                     <el-dropdown-item command="copy-id">复制会话 ID</el-dropdown-item>
+                    <el-dropdown-item
+                      class="conversation-item-dropdown__item conversation-item-dropdown__item--danger"
+                      command="delete"
+                    >
+                      <el-icon><Delete /></el-icon>
+                      <span>删除会话</span>
+                    </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -1326,7 +1532,12 @@ onBeforeUnmount(() => {
               <strong>{{ message.roleCode }}</strong>
               <span>{{ formatTime(message.createdAt) }}</span>
             </div>
-            <p v-if="message.content">{{ message.content }}</p>
+            <div
+              v-if="message.roleCode === 'ASSISTANT' && message.content"
+              class="assistant-markdown"
+              v-html="message.renderedContentHtml || ''"
+            ></div>
+            <p v-else-if="message.content">{{ message.content }}</p>
             <div v-else-if="message.roleCode === 'ASSISTANT' && message.uiState === 'thinking'" class="thinking-block">
               <span class="thinking-dot"></span>
               <span>{{ message.progressMessage || '模型正在思考，请稍候…' }}</span>
@@ -1434,11 +1645,17 @@ onBeforeUnmount(() => {
             <strong>{{ currentRoundSummary.ragStatus }}</strong>
             <small>命中 {{ currentRoundSummary.retrievedCount }} 个片段</small>
           </div>
+          <div class="trace-summary-card">
+            <span>Prompt</span>
+            <strong>{{ currentRoundSummary.promptSummaryText }}</strong>
+            <small>{{ currentRoundSummary.promptSource }} · 共 {{ currentRoundSummary.promptBlocks }} 块</small>
+          </div>
         </div>
 
         <div class="trace-toolbar">
           <el-select v-model="traceFilter" class="trace-filter-select">
             <el-option label="全部事件" value="ALL" />
+            <el-option label="只看 PROMPT" value="PROMPT" />
             <el-option label="只看 RAG" value="RAG" />
             <el-option label="只看 MODEL" value="MODEL" />
             <el-option label="只看 TOOL" value="TOOL" />
@@ -1520,6 +1737,9 @@ onBeforeUnmount(() => {
         <span>{{ activeConversationId ? '修改后会立即保存到当前会话。' : '当前仅保留发送前草稿。' }}</span>
       </div>
 
+      <p v-if="!activeConversationId" class="hint-text">
+        草稿态下这里的配置不会提前创建空会话；首轮发送时会和新会话一起落库。
+      </p>
       <div class="chat-toolbar">
         <el-switch v-model="modeState.enableRag" active-text="启用 RAG" @change="handleConversationSettingsChange" />
         <el-switch
@@ -1546,7 +1766,7 @@ onBeforeUnmount(() => {
           </div>
           <el-select
             v-model="selectedKnowledgeBaseIds"
-            :disabled="!activeConversationId || !modeState.enableRag || knowledgeLoading"
+            :disabled="!modeState.enableRag || knowledgeLoading"
             clearable
             collapse-tags
             collapse-tags-tooltip
@@ -1582,7 +1802,7 @@ onBeforeUnmount(() => {
           </div>
           <el-select
             v-model="selectedMcpServerIds"
-            :disabled="!activeConversationId || !modeState.enableAgent || mcpLoading"
+            :disabled="!modeState.enableAgent || mcpLoading"
             clearable
             collapse-tags
             collapse-tags-tooltip
@@ -1992,6 +2212,134 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 
+:global(.conversation-item-dropdown) {
+  padding: 8px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(18px);
+}
+
+:global(.conversation-item-dropdown .el-dropdown-menu) {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+:global(.conversation-item-dropdown .el-dropdown-menu__item) {
+  min-width: 180px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+:global(.conversation-item-dropdown .el-dropdown-menu__item .el-icon) {
+  color: #64748b;
+  font-size: 15px;
+}
+
+:global(.conversation-item-dropdown .el-dropdown-menu__item:not(.is-disabled):hover),
+:global(.conversation-item-dropdown .el-dropdown-menu__item:not(.is-disabled):focus) {
+  background: rgba(245, 247, 250, 0.96);
+  color: #0f172a;
+}
+
+:global(.conversation-item-dropdown .conversation-item-dropdown__item--danger) {
+  color: #b42318;
+}
+
+:global(.conversation-item-dropdown .conversation-item-dropdown__item--danger .el-icon) {
+  color: #dc2626;
+}
+
+:global(.conversation-item-dropdown .conversation-item-dropdown__item--danger:not(.is-disabled):hover),
+:global(.conversation-item-dropdown .conversation-item-dropdown__item--danger:not(.is-disabled):focus) {
+  background: rgba(254, 242, 242, 0.96);
+  color: #991b1b;
+}
+
+:global(.conversation-delete-dialog) {
+  width: min(480px, calc(100vw - 32px));
+  border-radius: 22px;
+  padding: 12px;
+}
+
+:global(.conversation-delete-dialog .el-message-box__container) {
+  padding: 4px 0 0;
+}
+
+:global(.conversation-delete-dialog .el-message-box__status) {
+  display: none;
+}
+
+:global(.conversation-delete-dialog .el-message-box__header) {
+  padding: 6px 0 0;
+}
+
+:global(.conversation-delete-dialog .el-message-box__title) {
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+:global(.conversation-delete-dialog .el-message-box__content) {
+  padding: 14px 0 6px;
+  color: #475569;
+  line-height: 1.7;
+}
+
+:global(.conversation-delete-dialog .el-message-box__message) {
+  margin: 0;
+}
+
+:global(.conversation-delete-dialog .el-message-box__message p) {
+  margin: 0;
+}
+
+:global(.conversation-delete-dialog .el-message-box__btns) {
+  gap: 10px;
+  padding: 14px 0 0;
+}
+
+:global(.conversation-delete-dialog .el-message-box__btns .el-button) {
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 14px;
+  font-weight: 600;
+}
+
+:global(.conversation-delete-dialog__cancel) {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(248, 250, 252, 0.92);
+  color: #334155;
+}
+
+:global(.conversation-delete-dialog__cancel:hover),
+:global(.conversation-delete-dialog__cancel:focus-visible) {
+  border-color: rgba(15, 23, 42, 0.16);
+  background: rgba(241, 245, 249, 0.96);
+  color: #0f172a;
+}
+
+:global(.conversation-delete-dialog__confirm) {
+  border-color: #dc2626;
+  background: #dc2626;
+}
+
+:global(.conversation-delete-dialog__confirm:hover),
+:global(.conversation-delete-dialog__confirm:focus-visible) {
+  border-color: #b91c1c;
+  background: #b91c1c;
+}
+
 .conversation-list {
   display: grid;
   gap: 6px;
@@ -2176,6 +2524,7 @@ onBeforeUnmount(() => {
 
 .chat-history {
   display: grid;
+  align-content: start;
   gap: 12px;
   min-height: 0;
   height: 100%;
@@ -2239,6 +2588,108 @@ onBeforeUnmount(() => {
   margin: 8px 0 0;
   white-space: pre-wrap;
   line-height: 1.75;
+}
+
+.assistant-markdown {
+  display: grid;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.assistant-markdown :deep(p),
+.assistant-markdown :deep(ul),
+.assistant-markdown :deep(ol),
+.assistant-markdown :deep(blockquote),
+.assistant-markdown :deep(pre),
+.assistant-markdown :deep(table) {
+  margin: 0;
+}
+
+.assistant-markdown :deep(h1),
+.assistant-markdown :deep(h2),
+.assistant-markdown :deep(h3),
+.assistant-markdown :deep(h4),
+.assistant-markdown :deep(h5),
+.assistant-markdown :deep(h6) {
+  margin: 0;
+  color: #0f172a;
+  line-height: 1.35;
+}
+
+.assistant-markdown :deep(h1) {
+  font-size: 24px;
+}
+
+.assistant-markdown :deep(h2) {
+  font-size: 20px;
+}
+
+.assistant-markdown :deep(h3) {
+  font-size: 17px;
+}
+
+.assistant-markdown :deep(ul),
+.assistant-markdown :deep(ol) {
+  padding-left: 20px;
+  line-height: 1.75;
+}
+
+.assistant-markdown :deep(li + li) {
+  margin-top: 6px;
+}
+
+.assistant-markdown :deep(blockquote) {
+  padding-left: 12px;
+  border-left: 3px solid rgba(31, 78, 121, 0.2);
+  color: #475569;
+}
+
+.assistant-markdown :deep(code) {
+  padding: 0.14em 0.4em;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.06);
+  color: #8b5e21;
+  font-size: 0.92em;
+}
+
+.assistant-markdown :deep(pre) {
+  overflow-x: auto;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #102033;
+  color: #e2e8f0;
+}
+
+.assistant-markdown :deep(pre code) {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.assistant-markdown :deep(a) {
+  color: #1f4e79;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.assistant-markdown :deep(table) {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.assistant-markdown :deep(th),
+.assistant-markdown :deep(td) {
+  padding: 8px 10px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.assistant-markdown :deep(th) {
+  background: rgba(241, 245, 249, 0.9);
+  color: #0f172a;
 }
 
 .message-meta strong {

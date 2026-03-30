@@ -46,6 +46,8 @@ export interface ConversationMessage {
   uiState?: 'thinking' | 'streaming' | 'done' | 'error'
   thinkingStartedAt?: number
   progressMessage?: string
+  renderedContentHtml?: string
+  renderCacheKey?: string
 }
 
 export async function createConversation(
@@ -97,5 +99,12 @@ export async function clearConversationMemory(
       method: 'POST',
     },
   )
+  return response.data
+}
+
+export async function deleteConversation(conversationId: number): Promise<boolean> {
+  const response = await request<boolean>(`/api/v1/conversations/${conversationId}`, {
+    method: 'DELETE',
+  })
   return response.data
 }

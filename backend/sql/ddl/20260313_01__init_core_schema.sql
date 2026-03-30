@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS mcp_tool_snapshot (
   runtime_tool_name VARCHAR(128) NOT NULL COMMENT 'runtime unique tool name, e.g. serverAlias__toolName',
   origin_tool_name VARCHAR(128) NOT NULL COMMENT 'original remote MCP tool name',
   tool_title VARCHAR(255) DEFAULT NULL,
-  description VARCHAR(1024) DEFAULT NULL,
+  description TEXT,
   input_schema_json JSON DEFAULT NULL,
   output_schema_json JSON DEFAULT NULL,
   enabled TINYINT NOT NULL DEFAULT 1,

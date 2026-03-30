@@ -14,6 +14,16 @@ import org.apache.ibatis.annotations.Update;
 public interface McpToolSnapshotMapper {
 
     @Select("""
+            SELECT CHARACTER_MAXIMUM_LENGTH
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'mcp_tool_snapshot'
+              AND COLUMN_NAME = 'description'
+            LIMIT 1
+            """)
+    Integer selectDescriptionColumnLimit();
+
+    @Select("""
             <script>
             SELECT
               mts.id,

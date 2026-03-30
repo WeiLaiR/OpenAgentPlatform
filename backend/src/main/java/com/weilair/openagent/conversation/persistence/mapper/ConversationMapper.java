@@ -4,6 +4,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 import com.weilair.openagent.conversation.model.ConversationDO;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Options;
@@ -105,4 +106,22 @@ public interface ConversationMapper {
             @Param("memoryEnabled") Boolean memoryEnabled,
             @Param("modeCode") String modeCode
     );
+
+    @Update("""
+            UPDATE conversation
+            SET title = #{title},
+                updated_at = CURRENT_TIMESTAMP(3)
+            WHERE id = #{conversationId}
+              AND status = 1
+            """)
+    int updateTitle(
+            @Param("conversationId") Long conversationId,
+            @Param("title") String title
+    );
+
+    @Delete("""
+            DELETE FROM conversation
+            WHERE id = #{conversationId}
+            """)
+    int deleteById(@Param("conversationId") Long conversationId);
 }

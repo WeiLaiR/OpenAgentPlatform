@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { RequestError } from '@/api/http'
 import {
   createKnowledgeBase,
+  deleteKnowledgeFile,
   indexKnowledgeFile,
   listKnowledgeSegments,
   listKnowledgeBases,
   listKnowledgeFiles,
+  reembedKnowledgeSegment,
   retrieveKnowledge,
+  updateKnowledgeSegment,
   uploadKnowledgeFile,
   type KnowledgeBase,
   type KnowledgeFile,
   type KnowledgeSegment,
+  type KnowledgeSegmentUpdateRequest,
   type KnowledgeRetrieveResult,
   type RagSnippet,
 } from '@/api/knowledge'
@@ -39,9 +43,13 @@ const retrieveResult = ref<KnowledgeRetrieveResult | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const segmentPanelRef = ref<HTMLElement | null>(null)
 const pendingIndexRequestIds = ref<number[]>([])
+const pendingDeleteFileIds = ref<number[]>([])
+const pendingSegmentSaveIds = ref<number[]>([])
+const pendingSegmentReembedIds = ref<number[]>([])
 const autoRefreshEnabled = ref(true)
 const segmentKeyword = ref('')
 const expandedSegmentKeys = ref<string[]>([])
+const editingSegmentId = ref<number | null>(null)
 const fileFilters = reactive({
   keyword: '',
   parseStatus: 'ALL',
@@ -52,6 +60,10 @@ const fileSort = reactive({
   order: 'DESC' as 'ASC' | 'DESC',
 })
 const expandedSnippetKeys = ref<string[]>([])
+const segmentEditForm = reactive({
+  fullText: '',
+  metadataJsonText: '',
+})
 
 let fileRefreshTimer: number | null = null
 const parseStatusSortWeight: Record<string, number> = {
@@ -116,6 +128,10 @@ const retrieveScopeNames = computed(() => {
 
 const indexedFileCount = computed(() => {
   return knowledgeFiles.value.filter((item) => item.indexStatus === 'INDEXED').length
+})
+
+const activeSegmentFile = computed(() => {
+  return knowledgeFiles.value.find((item) => item.id === selectedSegmentFileId.value) ?? null
 })
 
 const filteredKnowledgeFiles = computed(() => {
@@ -329,16 +345,50 @@ async function handleIndexFile(fileId: number) {
   try {
     const result = await indexKnowledgeFile(fileId)
     ElMessage.success(`文件索引完成，共生成 ${result.segmentCount} 个片段。`)
-    await Promise.all([loadKnowledgeBases(), loadKnowledgeFiles()])
-    if (selectedSegmentFileId.value === fileId) {
-      await loadKnowledgeSegments(fileId)
-    }
+    await refreshKnowledgeAfterMutation({ refreshSegmentsFileId: fileId, rerunRetrieve: true })
   } catch (error) {
     ElMessage.error(error instanceof RequestError ? error.message : '文件索引失败。')
     await loadKnowledgeFiles()
   } finally {
     pendingIndexRequestIds.value = pendingIndexRequestIds.value.filter((id) => id !== fileId)
     reconcileFileRefresh()
+  }
+}
+
+async function handleDeleteFile(file: KnowledgeFile) {
+  if (isFileIndexing(file.id)) {
+    ElMessage.warning('当前文件仍在索引中，请等待本轮完成后再删除。')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `你将删除“${file.fileName}”。删除后会同步清理该文件的片段记录、Milvus 向量和本地存储文件，当前实现为物理删除，操作后无法恢复。`,
+      '删除文件',
+      {
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+
+  pendingDeleteFileIds.value = Array.from(new Set([...pendingDeleteFileIds.value, file.id]))
+
+  try {
+    const result = await deleteKnowledgeFile(file.id)
+    if (selectedSegmentFileId.value === file.id) {
+      cancelSegmentEditing()
+    }
+    ElMessage.success(
+      `文件已删除，清理了 ${result.deletedSegmentCount} 个片段和 ${result.deletedVectorCount} 条向量记录。`,
+    )
+    await refreshKnowledgeAfterMutation({ rerunRetrieve: true })
+  } catch (error) {
+    ElMessage.error(error instanceof RequestError ? error.message : '文件删除失败。')
+  } finally {
+    pendingDeleteFileIds.value = pendingDeleteFileIds.value.filter((id) => id !== file.id)
   }
 }
 
@@ -356,6 +406,14 @@ async function handleRetrieve() {
   retrieving.value = true
   retrieveError.value = ''
 
+  await runRetrieve()
+}
+
+async function runRetrieve(silent = false) {
+  const previousResult = retrieveResult.value
+  const previousError = retrieveError.value
+  retrieveError.value = ''
+
   try {
     retrieveResult.value = await retrieveKnowledge({
       query: retrieveForm.query.trim(),
@@ -365,6 +423,11 @@ async function handleRetrieve() {
     })
     expandedSnippetKeys.value = retrieveResult.value.snippets.slice(0, 1).map((item) => item.milvusPrimaryKey)
   } catch (error) {
+    if (silent) {
+      retrieveResult.value = previousResult
+      retrieveError.value = previousError
+      return
+    }
     retrieveResult.value = null
     retrieveError.value = error instanceof RequestError ? error.message : '检索测试失败。'
   } finally {
@@ -382,6 +445,7 @@ async function loadKnowledgeSegments(fileId = selectedSegmentFileId.value) {
     knowledgeSegments.value = []
     segmentError.value = ''
     expandedSegmentKeys.value = []
+    cancelSegmentEditing()
     return
   }
 
@@ -393,10 +457,12 @@ async function loadKnowledgeSegments(fileId = selectedSegmentFileId.value) {
       keyword: segmentKeyword.value.trim() || undefined,
       limit: DEFAULT_SEGMENT_LIMIT,
     })
+    syncEditingSegmentAfterReload()
     expandedSegmentKeys.value = knowledgeSegments.value.slice(0, 1).map((item) => item.milvusPrimaryKey)
   } catch (error) {
     knowledgeSegments.value = []
     expandedSegmentKeys.value = []
+    cancelSegmentEditing()
     segmentError.value = error instanceof RequestError ? error.message : '分片列表加载失败，请稍后重试。'
   } finally {
     loadingSegments.value = false
@@ -409,6 +475,7 @@ function clearSegmentSelection() {
   knowledgeSegments.value = []
   segmentError.value = ''
   expandedSegmentKeys.value = []
+  cancelSegmentEditing()
 }
 
 async function focusSegmentsForFile(fileId: number) {
@@ -434,6 +501,29 @@ function markFileAsIndexing(fileId: number) {
   target.parseStatus = 'PARSING'
   target.indexStatus = 'INDEXING'
   target.errorMessage = null
+}
+
+async function refreshKnowledgeAfterMutation(options: {
+  refreshSegmentsFileId?: number | null
+  rerunRetrieve?: boolean
+} = {}) {
+  await Promise.all([loadKnowledgeBases(), loadKnowledgeFiles()])
+
+  const targetSegmentFileId = options.refreshSegmentsFileId ?? selectedSegmentFileId.value
+  if (targetSegmentFileId && knowledgeFiles.value.some((item) => item.id === targetSegmentFileId)) {
+    selectedSegmentFileId.value = targetSegmentFileId
+    await loadKnowledgeSegments(targetSegmentFileId)
+  }
+
+  if (
+    options.rerunRetrieve &&
+    retrieveResult.value &&
+    retrieveForm.query.trim() &&
+    retrieveForm.knowledgeBaseIds.length > 0
+  ) {
+    retrieving.value = true
+    await runRetrieve(true)
+  }
 }
 
 function compareKnowledgeFile(left: KnowledgeFile, right: KnowledgeFile) {
@@ -522,6 +612,106 @@ function isFileIndexing(fileId: number) {
       (item) => item.id === fileId && (item.indexStatus === 'INDEXING' || item.parseStatus === 'PARSING'),
     )
   )
+}
+
+function isFileDeleting(fileId: number) {
+  return pendingDeleteFileIds.value.includes(fileId)
+}
+
+function isSegmentEditing(segmentId: number) {
+  return editingSegmentId.value === segmentId
+}
+
+function isOtherSegmentEditing(segmentId: number) {
+  return editingSegmentId.value !== null && editingSegmentId.value !== segmentId
+}
+
+function isSegmentSaving(segmentId: number) {
+  return pendingSegmentSaveIds.value.includes(segmentId)
+}
+
+function isSegmentReembedding(segmentId: number) {
+  return pendingSegmentReembedIds.value.includes(segmentId)
+}
+
+function startEditSegment(segment: KnowledgeSegment) {
+  editingSegmentId.value = segment.id
+  segmentEditForm.fullText = segment.fullText
+  segmentEditForm.metadataJsonText = formatSegmentMetadataForEditor(segment.metadataJson)
+  expandedSegmentKeys.value = Array.from(
+    new Set([...expandedSegmentKeys.value, segment.milvusPrimaryKey, `${segment.milvusPrimaryKey}:metadata`]),
+  )
+}
+
+function cancelSegmentEditing() {
+  editingSegmentId.value = null
+  segmentEditForm.fullText = ''
+  segmentEditForm.metadataJsonText = ''
+}
+
+function syncEditingSegmentAfterReload() {
+  if (editingSegmentId.value == null) {
+    return
+  }
+  const current = knowledgeSegments.value.find((item) => item.id === editingSegmentId.value)
+  if (!current) {
+    cancelSegmentEditing()
+    return
+  }
+  segmentEditForm.fullText = current.fullText
+  segmentEditForm.metadataJsonText = formatSegmentMetadataForEditor(current.metadataJson)
+}
+
+async function handleSaveSegment(segment: KnowledgeSegment) {
+  const normalizedFullText = segmentEditForm.fullText.trim()
+  if (!normalizedFullText) {
+    ElMessage.error('片段文本不能为空。')
+    return
+  }
+
+  let requestBody: KnowledgeSegmentUpdateRequest
+  try {
+    requestBody = {
+      fullText: normalizedFullText,
+      metadataJson: parseSegmentMetadataDraft(segmentEditForm.metadataJsonText),
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '片段元数据解析失败。')
+    return
+  }
+
+  pendingSegmentSaveIds.value = Array.from(new Set([...pendingSegmentSaveIds.value, segment.id]))
+
+  try {
+    await updateKnowledgeSegment(segment.id, requestBody)
+    ElMessage.success(`片段 #${segment.segmentNo} 已保存，并已同步重算当前向量。`)
+    cancelSegmentEditing()
+    await refreshKnowledgeAfterMutation({
+      refreshSegmentsFileId: segment.fileId,
+      rerunRetrieve: true,
+    })
+  } catch (error) {
+    ElMessage.error(error instanceof RequestError ? error.message : '片段保存失败。')
+  } finally {
+    pendingSegmentSaveIds.value = pendingSegmentSaveIds.value.filter((id) => id !== segment.id)
+  }
+}
+
+async function handleReembedSegment(segment: KnowledgeSegment) {
+  pendingSegmentReembedIds.value = Array.from(new Set([...pendingSegmentReembedIds.value, segment.id]))
+
+  try {
+    await reembedKnowledgeSegment(segment.id)
+    ElMessage.success(`片段 #${segment.segmentNo} 的向量已重算。`)
+    await refreshKnowledgeAfterMutation({
+      refreshSegmentsFileId: segment.fileId,
+      rerunRetrieve: true,
+    })
+  } catch (error) {
+    ElMessage.error(error instanceof RequestError ? error.message : '片段向量重算失败。')
+  } finally {
+    pendingSegmentReembedIds.value = pendingSegmentReembedIds.value.filter((id) => id !== segment.id)
+  }
 }
 
 function formatTime(timestamp: number | null | undefined) {
@@ -634,6 +824,29 @@ function formatSegmentMetadata(metadata: KnowledgeSegment['metadataJson']) {
   return JSON.stringify(metadata, null, 2)
 }
 
+function formatSegmentMetadataForEditor(metadata: KnowledgeSegment['metadataJson']) {
+  if (metadata == null) {
+    return ''
+  }
+  if (typeof metadata === 'string') {
+    return metadata
+  }
+  return JSON.stringify(metadata, null, 2)
+}
+
+function parseSegmentMetadataDraft(metadataText: string) {
+  const normalized = metadataText.trim()
+  if (!normalized) {
+    return null
+  }
+
+  try {
+    return JSON.parse(normalized) as unknown
+  } catch {
+    throw new Error('片段元数据必须是合法 JSON；如果暂时不想改 metadata，可以保持为空。')
+  }
+}
+
 onMounted(async () => {
   await loadKnowledgeBases(false)
 })
@@ -724,7 +937,7 @@ onBeforeUnmount(() => {
           {{ activeKnowledgeBase.description }}
         </p>
         <p v-else class="description-text">
-          当前知识库还没有描述。现在已支持文件级管理和按文件浏览分片；片段级编辑与单片重算仍留到后续接口补齐后实现。
+          当前知识库还没有描述。现在已支持文件级删除、文件级重建索引、片段级文本修订和单片向量重算；知识库页正在从“可查看”升级到“可维护”。
         </p>
       </el-card>
 
@@ -863,7 +1076,7 @@ onBeforeUnmount(() => {
               <span v-else class="meta-inline">无</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="116">
+          <el-table-column label="操作" width="148">
             <template #default="{ row }">
               <div class="table-action-stack">
                 <el-button
@@ -880,7 +1093,16 @@ onBeforeUnmount(() => {
                   type="primary"
                   @click="handleIndexFile(row.id)"
                 >
-                  {{ isFileIndexing(row.id) ? '索引中' : '触发索引' }}
+                  {{ isFileIndexing(row.id) ? '索引中' : row.indexStatus === 'INDEXED' ? '重建索引' : '触发索引' }}
+                </el-button>
+                <el-button
+                  :disabled="isFileIndexing(row.id)"
+                  :loading="isFileDeleting(row.id)"
+                  link
+                  type="danger"
+                  @click="handleDeleteFile(row)"
+                >
+                  删除文件
                 </el-button>
               </div>
             </template>
@@ -908,7 +1130,8 @@ onBeforeUnmount(() => {
           <div class="panel-note">
             <span>先在文件列表点“查看分片”，或在这里手动选择一个已索引文件</span>
             <span>当前最多展示 {{ DEFAULT_SEGMENT_LIMIT }} 个片段，按 `segmentNo` 顺序排列</span>
-            <span>片段编辑和单片向量重算还未接入，本轮先解决“可查看、可定位”</span>
+            <span>当前文件：{{ activeSegmentFile?.fileName ?? '未选择文件' }}</span>
+            <span>现在可以直接在这里编辑片段文本、重算单片向量，并联动回刷检索测试结果</span>
           </div>
 
           <div class="segment-toolbar">
@@ -963,6 +1186,23 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="snippet-actions">
                   <el-button
+                    :disabled="isOtherSegmentEditing(segment.id)"
+                    link
+                    type="primary"
+                    @click="isSegmentEditing(segment.id) ? cancelSegmentEditing() : startEditSegment(segment)"
+                  >
+                    {{ isSegmentEditing(segment.id) ? '取消编辑' : '编辑片段' }}
+                  </el-button>
+                  <el-button
+                    :disabled="isOtherSegmentEditing(segment.id)"
+                    :loading="isSegmentReembedding(segment.id)"
+                    link
+                    type="primary"
+                    @click="handleReembedSegment(segment)"
+                  >
+                    重算向量
+                  </el-button>
+                  <el-button
                     link
                     type="primary"
                     @click="copyText(segment.fullText, '已复制完整片段。')"
@@ -984,6 +1224,42 @@ onBeforeUnmount(() => {
                 <span>Tokens {{ segment.tokenCount }}</span>
                 <span v-if="segment.pageNo !== null">Page {{ segment.pageNo }}</span>
                 <span>{{ segment.milvusPrimaryKey }}</span>
+              </div>
+              <div v-if="isSegmentEditing(segment.id)" class="segment-editor">
+                <div class="segment-editor__field">
+                  <label class="field-label">片段正文</label>
+                  <el-input
+                    v-model="segmentEditForm.fullText"
+                    :rows="8"
+                    maxlength="20000"
+                    resize="vertical"
+                    show-word-limit
+                    type="textarea"
+                  />
+                </div>
+                <div class="segment-editor__field">
+                  <label class="field-label">片段元数据 `metadataJson`</label>
+                  <el-input
+                    v-model="segmentEditForm.metadataJsonText"
+                    :rows="5"
+                    placeholder="留空表示沿用当前 metadata；如需修改，请输入合法 JSON。"
+                    resize="vertical"
+                    type="textarea"
+                  />
+                  <div class="form-item-hint">
+                    文本保存会同步回写 `textPreview / tokenCount / metadataJson` 并覆盖当前 segment 向量；如果已经涉及重新切分，应该返回文件级重建索引。
+                  </div>
+                </div>
+                <div class="segment-editor__actions">
+                  <el-button @click="cancelSegmentEditing">取消</el-button>
+                  <el-button
+                    :loading="isSegmentSaving(segment.id)"
+                    type="primary"
+                    @click="handleSaveSegment(segment)"
+                  >
+                    保存片段
+                  </el-button>
+                </div>
               </div>
               <p class="snippet-preview" v-html="highlightSegmentText(segment.textPreview)"></p>
               <div class="meta-row">
@@ -1534,6 +1810,27 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(15, 23, 42, 0.08);
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.78);
+}
+
+.segment-editor {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.9);
+}
+
+.segment-editor__field {
+  display: grid;
+  gap: 8px;
+}
+
+.segment-editor__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .segment-metadata {

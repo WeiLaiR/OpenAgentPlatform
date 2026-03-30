@@ -56,6 +56,14 @@ export interface KnowledgeFileIndexResult {
   updatedAt: number
 }
 
+export interface KnowledgeFileDeleteResult {
+  fileId: number
+  knowledgeBaseId: number
+  deletedSegmentCount: number
+  deletedVectorCount: number
+  storageDeleted: boolean
+}
+
 export interface KnowledgeSegment {
   id: number
   knowledgeBaseId: number
@@ -70,6 +78,11 @@ export interface KnowledgeSegment {
   metadataJson: Record<string, unknown> | string | null
   milvusPrimaryKey: string
   createdAt: number
+}
+
+export interface KnowledgeSegmentUpdateRequest {
+  fullText: string
+  metadataJson?: unknown | null
 }
 
 export interface RagSnippet {
@@ -168,6 +181,13 @@ export async function indexKnowledgeFile(fileId: number): Promise<KnowledgeFileI
   return response.data
 }
 
+export async function deleteKnowledgeFile(fileId: number): Promise<KnowledgeFileDeleteResult> {
+  const response = await request<KnowledgeFileDeleteResult>(`/api/v1/knowledge-files/${fileId}`, {
+    method: 'DELETE',
+  })
+  return response.data
+}
+
 export async function listKnowledgeSegments(
   fileId: number,
   params: {
@@ -186,6 +206,24 @@ export async function listKnowledgeSegments(
 
   const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ''
   const response = await request<KnowledgeSegment[]>(`/api/v1/knowledge-files/${fileId}/segments${suffix}`)
+  return response.data
+}
+
+export async function updateKnowledgeSegment(
+  segmentId: number,
+  requestBody: KnowledgeSegmentUpdateRequest,
+): Promise<KnowledgeSegment> {
+  const response = await request<KnowledgeSegment>(`/api/v1/knowledge-segments/${segmentId}`, {
+    method: 'PUT',
+    body: JSON.stringify(requestBody),
+  })
+  return response.data
+}
+
+export async function reembedKnowledgeSegment(segmentId: number): Promise<KnowledgeSegment> {
+  const response = await request<KnowledgeSegment>(`/api/v1/knowledge-segments/${segmentId}/re-embed`, {
+    method: 'POST',
+  })
   return response.data
 }
 

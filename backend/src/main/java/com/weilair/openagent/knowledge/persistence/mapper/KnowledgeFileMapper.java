@@ -7,6 +7,7 @@ import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Options;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
@@ -116,4 +117,10 @@ public interface KnowledgeFileMapper {
             @Param("parserResultJson") String parserResultJson,
             @Param("errorMessage") String errorMessage
     );
+
+    @Delete("""
+            DELETE FROM knowledge_file
+            WHERE id = #{fileId}
+            """)
+    int deleteById(@Param("fileId") Long fileId);
 }

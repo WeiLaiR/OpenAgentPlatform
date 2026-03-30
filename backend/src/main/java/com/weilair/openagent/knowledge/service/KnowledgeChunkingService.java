@@ -166,7 +166,7 @@ public class KnowledgeChunkingService {
         );
     }
 
-    private int estimateTokenCount(String text) {
+    static int estimateTokenCount(String text) {
         // 第一版先用经验值回填 token_count，后续再替换成真实 tokenizer 统计。
         return Math.max(1, (int) Math.ceil(text.length() / 4.0d));
     }

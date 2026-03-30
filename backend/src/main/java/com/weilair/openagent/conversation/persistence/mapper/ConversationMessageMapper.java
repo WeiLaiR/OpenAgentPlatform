@@ -3,6 +3,7 @@ package com.weilair.openagent.conversation.persistence.mapper;
 import java.util.List;
 
 import com.weilair.openagent.conversation.model.ConversationMessageDO;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Options;
@@ -102,4 +103,10 @@ public interface ConversationMessageMapper {
             @Param("conversationId") Long conversationId,
             @Param("turnLimit") int turnLimit
     );
+
+    @Delete("""
+            DELETE FROM conversation_message
+            WHERE conversation_id = #{conversationId}
+            """)
+    int deleteByConversationId(@Param("conversationId") Long conversationId);
 }

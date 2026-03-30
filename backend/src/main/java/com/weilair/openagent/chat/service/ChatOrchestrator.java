@@ -29,6 +29,7 @@ import dev.langchain4j.service.Result;
 import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.tool.BeforeToolExecution;
 import dev.langchain4j.service.tool.ToolExecution;
+import com.weilair.openagent.chat.prompt.PromptAssembly;
 import com.weilair.openagent.chat.exception.ChatServiceUnavailableException;
 import com.weilair.openagent.chat.model.ChatStreamSession;
 import com.weilair.openagent.chat.service.AgentAiServiceFactory.StreamingAgentAssistant;
@@ -39,6 +40,7 @@ import com.weilair.openagent.chat.service.ToolRuntimeResolver.ResolvedToolRuntim
 import com.weilair.openagent.common.request.RequestIdContext;
 import com.weilair.openagent.conversation.model.ConversationDO;
 import com.weilair.openagent.conversation.service.ConversationService;
+import com.weilair.openagent.conversation.service.ConversationTitleService;
 import com.weilair.openagent.trace.service.ChatModelObservationContextHolder;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
@@ -47,6 +49,7 @@ import com.weilair.openagent.web.vo.RagSnippetVO;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 @Service
 public class ChatOrchestrator {
@@ -76,6 +79,7 @@ public class ChatOrchestrator {
     private final RagRuntimeResolver ragRuntimeResolver;
     private final ToolRuntimeResolver toolRuntimeResolver;
     private final TracePublisher tracePublisher;
+    private final ConversationTitleService conversationTitleService;
     private final ChatModelObservationContextHolder chatModelObservationContextHolder;
     private final ConversationExecutionGuard executionGuard;
     private final ExecutorService executorService;
@@ -91,6 +95,7 @@ public class ChatOrchestrator {
             RagRuntimeResolver ragRuntimeResolver,
             ToolRuntimeResolver toolRuntimeResolver,
             TracePublisher tracePublisher,
+            ConversationTitleService conversationTitleService,
             ChatModelObservationContextHolder chatModelObservationContextHolder,
             ConversationExecutionGuard executionGuard
     ) {
@@ -104,6 +109,7 @@ public class ChatOrchestrator {
         this.ragRuntimeResolver = ragRuntimeResolver;
         this.toolRuntimeResolver = toolRuntimeResolver;
         this.tracePublisher = tracePublisher;
+        this.conversationTitleService = conversationTitleService;
         this.chatModelObservationContextHolder = chatModelObservationContextHolder;
         this.executionGuard = executionGuard;
         this.executorService = Executors.newVirtualThreadPerTaskExecutor();
@@ -145,6 +151,7 @@ public class ChatOrchestrator {
                         chatContextAssembler.assemble(conversation, executionSpec, request.message(), List.of());
                 ResolvedRagContext resolvedRagContext = resolveRagContext(baseChatContext, executionSpec, outputPort);
                 ChatContextAssembler.ChatContextSnapshot chatContext = resolvedRagContext.chatContext();
+                tracePromptAssemblyResolved(outputPort, executionSpec, chatContext);
                 ChatRoundResult roundResult = generateSyncAnswer(
                         chatModel,
                         conversation,
@@ -173,6 +180,7 @@ public class ChatOrchestrator {
             }
 
             long elapsedMillis = System.currentTimeMillis() - startedAt;
+            scheduleFirstRoundConversationTitle(request, conversation.getId(), outputPort.answer());
             tracePublisher.append(
                     outputPort,
                     answerResult.assistantMessageId(),
@@ -239,12 +247,14 @@ public class ChatOrchestrator {
                         chatContextAssembler.assemble(conversation, executionSpec, request.message(), List.of());
                 ResolvedRagContext resolvedRagContext = resolveRagContext(baseChatContext, executionSpec, outputPort);
                 ChatContextAssembler.ChatContextSnapshot chatContext = resolvedRagContext.chatContext();
+                tracePromptAssemblyResolved(outputPort, executionSpec, chatContext);
                 StreamingChatModel streamingChatModel = requireStreamingChatModel();
                 executorService.submit(() -> streamAnswer(
                         streamingChatModel,
                         outputPort,
                         chatContext,
-                        resolvedRagContext.ragSnippets().size()
+                        resolvedRagContext.ragSnippets().size(),
+                        request
                 ));
             }
 
@@ -273,7 +283,8 @@ public class ChatOrchestrator {
             StreamingChatModel streamingChatModel,
             ChatOutputPort outputPort,
             ChatContextAssembler.ChatContextSnapshot chatContext,
-            int ragSnippetCount
+            int ragSnippetCount,
+            ChatSendRequest request
     ) {
         outputPort.markRunning();
         long startedAt = System.currentTimeMillis();
@@ -315,6 +326,7 @@ public class ChatOrchestrator {
                                         null
                                 );
                                 applyChatMemoryUpdate(chatContext, new ChatRoundResult(answer, false, aiMessage, null));
+                                scheduleFirstRoundConversationTitle(request, outputPort.conversationId(), answer);
                                 outputPort.emitMessageEnd(answer, "stop");
                                 tracePublisher.append(
                                         outputPort,
@@ -429,8 +441,23 @@ public class ChatOrchestrator {
     ) {
         RagRuntime ragRuntime = ragRuntimeResolver.resolve(executionSpec);
         try (ResolvedToolRuntime toolRuntime = openToolRuntime(conversation, executionSpec, request, outputPort)) {
-            traceModelRequestStarted(outputPort, "SYNC", ragRuntime.enabled(), toolRuntime);
             traceRagStarted(outputPort, ragRuntime);
+            PromptAssembly promptAssembly = agentAiServiceFactory.buildPromptAssembly(toolRuntime);
+            tracePromptAssemblyResolved(
+                    outputPort,
+                    promptAssembly,
+                    promptAssemblyPayload(
+                            promptAssembly,
+                            "AGENT_AI_SERVICE",
+                            executionSpec.modeCode(),
+                            Map.of(
+                                    "systemMessageCount", promptAssembly.blocks().size(),
+                                    "toolCount", toolRuntime.toolCount(),
+                                    "toolRuntimeStatus", toolRuntime.status().name()
+                            )
+                    )
+            );
+            traceModelRequestStarted(outputPort, "SYNC", ragRuntime.enabled(), toolRuntime);
 
             SyncAgentAssistant assistant = agentAiServiceFactory.createSyncAssistant(
                     chatModel,
@@ -479,8 +506,23 @@ public class ChatOrchestrator {
         RagRuntime ragRuntime = ragRuntimeResolver.resolve(executionSpec);
         ResolvedToolRuntime toolRuntime = openToolRuntime(conversation, executionSpec, request, outputPort);
         outputPort.markRunning();
-        traceModelRequestStarted(outputPort, "STREAM", ragRuntime.enabled(), toolRuntime);
         traceRagStarted(outputPort, ragRuntime);
+        PromptAssembly promptAssembly = agentAiServiceFactory.buildPromptAssembly(toolRuntime);
+        tracePromptAssemblyResolved(
+                outputPort,
+                promptAssembly,
+                promptAssemblyPayload(
+                        promptAssembly,
+                        "AGENT_AI_SERVICE",
+                        executionSpec.modeCode(),
+                        Map.of(
+                                "systemMessageCount", promptAssembly.blocks().size(),
+                                "toolCount", toolRuntime.toolCount(),
+                                "toolRuntimeStatus", toolRuntime.status().name()
+                        )
+                )
+        );
+        traceModelRequestStarted(outputPort, "STREAM", ragRuntime.enabled(), toolRuntime);
 
         AtomicReference<List<RagSnippetVO>> ragSnippetsRef = new AtomicReference<>(List.of());
 
@@ -525,6 +567,7 @@ public class ChatOrchestrator {
                                     finishReason,
                                     null
                             );
+                            scheduleFirstRoundConversationTitle(request, outputPort.conversationId(), answer);
                             outputPort.emitMessageEnd(answer, finishReason);
                             tracePublisher.append(
                                     outputPort,
@@ -956,6 +999,66 @@ public class ChatOrchestrator {
         return payload;
     }
 
+    private void tracePromptAssemblyResolved(
+            ChatOutputPort outputPort,
+            ChatExecutionSpec executionSpec,
+            ChatContextAssembler.ChatContextSnapshot chatContext
+    ) {
+        tracePromptAssemblyResolved(
+                outputPort,
+                chatContext.promptAssembly(),
+                promptAssemblyPayload(
+                        chatContext.promptAssembly(),
+                        "CHAT_CONTEXT_ASSEMBLER",
+                        executionSpec.modeCode(),
+                        Map.of(
+                                "systemMessageCount", chatContext.systemMessages().size(),
+                                "historyMessageCount", chatContext.baseMemoryMessages().size(),
+                                "requestMessageCount", chatContext.requestMessages().size(),
+                                "requestStructure", "system -> history -> user"
+                        )
+                )
+        );
+    }
+
+    private void tracePromptAssemblyResolved(
+            ChatOutputPort outputPort,
+            PromptAssembly promptAssembly,
+            Map<String, Object> payload
+    ) {
+        if (promptAssembly == null || promptAssembly.blocks().isEmpty()) {
+            return;
+        }
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                "PROMPT_ASSEMBLY_RESOLVED",
+                "PROMPT",
+                payload,
+                true,
+                null
+        );
+    }
+
+    private Map<String, Object> promptAssemblyPayload(
+            PromptAssembly promptAssembly,
+            String promptSource,
+            String modeCode,
+            Map<String, Object> additionalFields
+    ) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("promptSource", promptSource);
+        payload.put("modeCode", modeCode);
+        PromptAssembly.PromptAssemblySummary summary = promptAssembly.summary();
+        payload.put("promptKeys", summary.promptKeys());
+        payload.put("blockCount", summary.blockCount());
+        payload.put("variableSummary", summary.variableSummary());
+        if (additionalFields != null && !additionalFields.isEmpty()) {
+            payload.putAll(additionalFields);
+        }
+        return payload;
+    }
+
     private Map<String, Object> agentToolsPayload(int toolCount, List<String> toolNames) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolCount", toolCount);
@@ -1138,6 +1241,23 @@ public class ChatOrchestrator {
         return finishReason.name().toLowerCase();
     }
 
+    /**
+     * 首轮标题生成只对“草稿态 -> 正式会话”这一跳生效。
+     *
+     * 因此这里直接使用“请求入参里没有 conversationId”作为判定条件，
+     * 避免在后续轮次反复覆盖标题，也避免把失败轮次写进标题生成链路。
+     */
+    private void scheduleFirstRoundConversationTitle(
+            ChatSendRequest request,
+            Long conversationId,
+            String assistantAnswer
+    ) {
+        if (request.conversationId() != null || !StringUtils.hasText(assistantAnswer)) {
+            return;
+        }
+        conversationTitleService.generateFirstRoundTitleAsync(conversationId, request.message(), assistantAnswer);
+    }
+
     private ResolvedRagContext resolveRagContext(
             ChatContextAssembler.ChatContextSnapshot baseChatContext,
             ChatExecutionSpec executionSpec,
@@ -1198,7 +1318,11 @@ public class ChatOrchestrator {
                 (int) (System.currentTimeMillis() - startedAt)
         );
         return new ResolvedRagContext(
-                baseChatContext.withRequestUserMessage(ragAugmentationResult.requestUserMessage()),
+                chatContextAssembler.rebuildWithResolvedRequest(
+                        baseChatContext,
+                        ragAugmentationResult.requestUserMessage(),
+                        ragSnippets
+                ),
                 ragSnippets
         );
     }

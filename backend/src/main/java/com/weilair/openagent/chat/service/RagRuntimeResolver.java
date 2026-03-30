@@ -12,11 +12,13 @@ import dev.langchain4j.rag.AugmentationRequest;
 import dev.langchain4j.rag.AugmentationResult;
 import dev.langchain4j.rag.DefaultRetrievalAugmentor;
 import dev.langchain4j.rag.RetrievalAugmentor;
-import dev.langchain4j.rag.content.ContentMetadata;
 import dev.langchain4j.rag.content.Content;
+import dev.langchain4j.rag.content.ContentMetadata;
 import dev.langchain4j.rag.content.injector.DefaultContentInjector;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import com.weilair.openagent.chat.prompt.PromptTemplateCatalog;
+import com.weilair.openagent.chat.prompt.PromptTemplateKey;
 import com.weilair.openagent.knowledge.service.KnowledgeEmbeddingService;
 import com.weilair.openagent.knowledge.service.KnowledgeTextSegmentEmbeddingStoreFactory;
 import com.weilair.openagent.web.vo.RagSnippetVO;
@@ -25,19 +27,14 @@ import org.springframework.stereotype.Component;
 @Component
 public class RagRuntimeResolver {
     /**
-     * 这一轮继续把 RAG 底座往 LangChain4j 官方主线回切：
+     * 这里继续把 RAG 底座往 LangChain4j 官方主线回切：
      * 1. `RetrievalAugmentor` 继续使用官方 `DefaultRetrievalAugmentor`
-     * 2. `ContentRetriever` 从过渡态自定义查询切回官方 `EmbeddingStoreContentRetriever`
-     * 3. 底层检索通过项目自有 Milvus/MySQL 能力适配成 `EmbeddingStore<TextSegment>`
+     * 2. `ContentRetriever` 继续使用官方 `EmbeddingStoreContentRetriever`
+     * 3. Prompt 模板继续使用官方 `PromptTemplate`
      *
-     * 这里仍然保留了一层自定义 `EmbeddingStore<TextSegment>` 适配，而没有直接接官方 `MilvusEmbeddingStore`，
-     * 原因写在 `KnowledgeTextSegmentEmbeddingStoreFactory` 注释中：
-     * 当前 LangChain4j 核心版本与官方 Milvus 集成模块并未完全对齐，
-     * 且项目现有 Milvus v2 client / partition 管理链路已经稳定落地。
-     *
-     * 因此当前实现与官方能力的关系是：
-     * - 已回到官方 `EmbeddingStoreContentRetriever`
-     * - 仅在最底层保留一层必要适配，桥接现有 Milvus/MySQL 数据面
+     * 当前仍保留一层项目自定义 `EmbeddingStore<TextSegment>` 适配，
+     * 用来桥接已落地的 Milvus/MySQL 检索面。
+     * Prompt 层则不再单独硬编码，统一改为从 `PromptTemplateCatalog` 取 `rag-context`。
      */
     private static final int DEFAULT_TOP_K = 4;
     private static final double DEFAULT_MIN_SCORE = 0.55d;
@@ -49,23 +46,19 @@ public class RagRuntimeResolver {
             "sourceTitle",
             "sourcePath"
     );
-    private static final PromptTemplate DEFAULT_RAG_PROMPT_TEMPLATE = PromptTemplate.from(
-            """
-                    {{userMessage}}
-
-                    请优先基于以下检索到的参考内容回答；如果参考内容不足以支持结论，要明确说明。
-                    {{contents}}"""
-    );
 
     private final KnowledgeTextSegmentEmbeddingStoreFactory knowledgeTextSegmentEmbeddingStoreFactory;
     private final KnowledgeEmbeddingService knowledgeEmbeddingService;
+    private final PromptTemplate ragPromptTemplate;
 
     public RagRuntimeResolver(
             KnowledgeTextSegmentEmbeddingStoreFactory knowledgeTextSegmentEmbeddingStoreFactory,
-            KnowledgeEmbeddingService knowledgeEmbeddingService
+            KnowledgeEmbeddingService knowledgeEmbeddingService,
+            PromptTemplateCatalog promptTemplateCatalog
     ) {
         this.knowledgeTextSegmentEmbeddingStoreFactory = knowledgeTextSegmentEmbeddingStoreFactory;
         this.knowledgeEmbeddingService = knowledgeEmbeddingService;
+        this.ragPromptTemplate = promptTemplateCatalog.template(PromptTemplateKey.RAG_CONTEXT);
     }
 
     public RagRuntime resolve(ChatExecutionSpec executionSpec) {
@@ -82,7 +75,7 @@ public class RagRuntimeResolver {
         RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
                 .contentRetriever(contentRetriever)
                 .contentInjector(DefaultContentInjector.builder()
-                        .promptTemplate(DEFAULT_RAG_PROMPT_TEMPLATE)
+                        .promptTemplate(ragPromptTemplate)
                         .metadataKeysToInclude(DEFAULT_METADATA_KEYS)
                         .build())
                 .build();
@@ -137,7 +130,8 @@ public class RagRuntimeResolver {
 
     /**
      * AI Services / TokenStream 路径拿到的是官方 `Content` 列表，
-     * 这里统一回转成平台当前已经在用的 `RagSnippetVO`，避免 orchestrator 再复制一份 metadata 解析逻辑。
+     * 这里统一回转成平台当前已经在用的 `RagSnippetVO`，
+     * 避免 orchestrator 再复制一份 metadata 解析逻辑。
      */
     public List<RagSnippetVO> toRagSnippets(List<Content> contents) {
         if (contents == null || contents.isEmpty()) {

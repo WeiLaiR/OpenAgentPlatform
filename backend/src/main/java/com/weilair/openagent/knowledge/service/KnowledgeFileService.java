@@ -5,11 +5,15 @@ import java.util.Locale;
 import java.util.Set;
 
 import com.weilair.openagent.common.util.TimeUtils;
+import com.weilair.openagent.knowledge.model.KnowledgeBaseDO;
 import com.weilair.openagent.knowledge.model.KnowledgeFileDO;
+import com.weilair.openagent.knowledge.persistence.mapper.KnowledgeSegmentMapper;
 import com.weilair.openagent.knowledge.persistence.mapper.KnowledgeFileMapper;
+import com.weilair.openagent.web.vo.KnowledgeFileDeleteVO;
 import com.weilair.openagent.web.vo.KnowledgeFileVO;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -31,16 +35,25 @@ public class KnowledgeFileService {
 
     private final KnowledgeBaseService knowledgeBaseService;
     private final KnowledgeFileMapper knowledgeFileMapper;
+    private final KnowledgeSegmentMapper knowledgeSegmentMapper;
     private final KnowledgeFileStorageService knowledgeFileStorageService;
+    private final MilvusKnowledgeVectorService milvusKnowledgeVectorService;
+    private final TransactionTemplate transactionTemplate;
 
     public KnowledgeFileService(
             KnowledgeBaseService knowledgeBaseService,
             KnowledgeFileMapper knowledgeFileMapper,
-            KnowledgeFileStorageService knowledgeFileStorageService
+            KnowledgeSegmentMapper knowledgeSegmentMapper,
+            KnowledgeFileStorageService knowledgeFileStorageService,
+            MilvusKnowledgeVectorService milvusKnowledgeVectorService,
+            TransactionTemplate transactionTemplate
     ) {
         this.knowledgeBaseService = knowledgeBaseService;
         this.knowledgeFileMapper = knowledgeFileMapper;
+        this.knowledgeSegmentMapper = knowledgeSegmentMapper;
         this.knowledgeFileStorageService = knowledgeFileStorageService;
+        this.milvusKnowledgeVectorService = milvusKnowledgeVectorService;
+        this.transactionTemplate = transactionTemplate;
     }
 
     /**
@@ -93,6 +106,41 @@ public class KnowledgeFileService {
             throw new IllegalArgumentException("知识库文件不存在: " + fileId);
         }
         return knowledgeFile;
+    }
+
+    /**
+     * 删除文件时要把“文件记录 / 片段记录 / 向量 / 存储文件”作为一个维护动作来理解：
+     * - 先基于文件拿到知识库和现有 segment 主键
+     * - 再在同一段服务逻辑里完成数据库删除与外部资源清理
+     * - 如果中途失败，就让整个删除动作失败，避免前端误以为已经彻底删干净
+     */
+    public KnowledgeFileDeleteVO deleteKnowledgeFile(Long fileId) {
+        KnowledgeFileDO knowledgeFile = requireKnowledgeFile(fileId);
+        KnowledgeBaseDO knowledgeBase = knowledgeBaseService.requireKnowledgeBase(knowledgeFile.getKnowledgeBaseId());
+        List<String> vectorIds = knowledgeSegmentMapper.selectMilvusPrimaryKeysByFileId(fileId);
+
+        int deletedSegmentCount = transactionTemplate.execute(status -> {
+            int segmentCount = knowledgeSegmentMapper.deleteByFileId(fileId);
+            int deletedFileCount = knowledgeFileMapper.deleteById(fileId);
+            if (deletedFileCount <= 0) {
+                throw new IllegalStateException("知识库文件删除失败，未删除到文件记录: " + fileId);
+            }
+
+            // 事务提交前同步清理外部派生资源，避免数据库先删成功而 Milvus / 存储层残留。
+            milvusKnowledgeVectorService.deleteVectors(knowledgeBase, vectorIds);
+            if (StringUtils.hasText(knowledgeFile.getStorageUri())) {
+                knowledgeFileStorageService.deleteStoredFile(knowledgeFile.getStorageUri());
+            }
+            return segmentCount;
+        });
+
+        return new KnowledgeFileDeleteVO(
+                fileId,
+                knowledgeFile.getKnowledgeBaseId(),
+                deletedSegmentCount,
+                vectorIds.size(),
+                StringUtils.hasText(knowledgeFile.getStorageUri())
+        );
     }
 
     private void validateUploadRequest(MultipartFile file, Boolean autoIndex) {

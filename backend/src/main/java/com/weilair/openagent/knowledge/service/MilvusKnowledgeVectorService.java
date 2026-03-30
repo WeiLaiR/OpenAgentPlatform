@@ -58,6 +58,18 @@ public class MilvusKnowledgeVectorService {
             List<String> existingVectorIds,
             List<KnowledgeVectorRecord> vectorRecords
     ) {
+        replaceVectors(knowledgeBase, existingVectorIds, vectorRecords);
+    }
+
+    /**
+     * 当前知识库维护既会出现“整文件覆盖重建”，也会出现“单 segment 覆盖更新”。
+     * 因此这里收口成一个通用的 replace 入口，让文件级和片段级都复用同一套 Milvus 覆盖语义。
+     */
+    public void replaceVectors(
+            KnowledgeBaseDO knowledgeBase,
+            List<String> existingVectorIds,
+            List<KnowledgeVectorRecord> vectorRecords
+    ) {
         if (vectorRecords == null || vectorRecords.isEmpty()) {
             throw new IllegalArgumentException("向量写入列表不能为空。");
         }

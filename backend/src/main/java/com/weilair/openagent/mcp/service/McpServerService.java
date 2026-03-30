@@ -41,6 +41,7 @@ public class McpServerService {
     private static final Long DEFAULT_USER_ID = 1L;
     private static final int DEFAULT_SERVER_LIMIT = 100;
     private static final int DEFAULT_TOOL_LIMIT = 300;
+    private static final int DEFAULT_TOOL_DESCRIPTION_LIMIT = 1024;
     private static final String DEFAULT_PROTOCOL_TYPE = "ANTHROPIC_MCP";
     private static final String DEFAULT_AUTH_TYPE = "NONE";
     private static final String DEFAULT_RISK_LEVEL = "MEDIUM";
@@ -153,7 +154,12 @@ public class McpServerService {
         try (McpClient client = mcpClientFactory.createClient(server)) {
             client.checkHealth();
             List<ToolSpecification> tools = client.listTools();
-            List<McpToolSnapshotDO> snapshots = buildToolSnapshots(server, tools, syncedAt);
+            List<McpToolSnapshotDO> snapshots = buildToolSnapshots(
+                    server,
+                    tools,
+                    syncedAt,
+                    resolveToolDescriptionLimit()
+            );
 
             mcpToolSnapshotMapper.deleteByServerId(serverId);
             if (!snapshots.isEmpty()) {
@@ -249,21 +255,27 @@ public class McpServerService {
     private List<McpToolSnapshotDO> buildToolSnapshots(
             McpServerDO server,
             List<ToolSpecification> tools,
-            LocalDateTime syncedAt
+            LocalDateTime syncedAt,
+            int descriptionLimit
     ) {
         return tools.stream()
-                .map(tool -> toMcpToolSnapshot(server, tool, syncedAt))
+                .map(tool -> toMcpToolSnapshot(server, tool, syncedAt, descriptionLimit))
                 .toList();
     }
 
-    private McpToolSnapshotDO toMcpToolSnapshot(McpServerDO server, ToolSpecification tool, LocalDateTime syncedAt) {
+    private McpToolSnapshotDO toMcpToolSnapshot(
+            McpServerDO server,
+            ToolSpecification tool,
+            LocalDateTime syncedAt,
+            int descriptionLimit
+    ) {
         McpToolSnapshotDO snapshot = new McpToolSnapshotDO();
         snapshot.setMcpServerId(server.getId());
         snapshot.setServerName(server.getName());
         snapshot.setRuntimeToolName(server.getName() + "__" + tool.name());
         snapshot.setOriginToolName(tool.name());
         snapshot.setToolTitle(resolveToolTitle(tool));
-        snapshot.setDescription(trimToNull(tool.description()));
+        snapshot.setDescription(trimToLength(tool.description(), descriptionLimit));
         snapshot.setInputSchemaJson(writeJson(normalizeJsonValue(tool.parameters())));
         snapshot.setOutputSchemaJson(null);
         snapshot.setEnabled(Boolean.TRUE);
@@ -290,6 +302,14 @@ public class McpServerService {
                 + "|" + nullSafe(snapshot.getDescription())
                 + "|" + nullSafe(snapshot.getInputSchemaJson());
         return DigestUtils.md5DigestAsHex(raw.getBytes());
+    }
+
+    private int resolveToolDescriptionLimit() {
+        Integer limit = mcpToolSnapshotMapper.selectDescriptionColumnLimit();
+        if (limit == null || limit <= 0) {
+            return DEFAULT_TOOL_DESCRIPTION_LIMIT;
+        }
+        return limit;
     }
 
     private McpServerVO toMcpServerVO(McpServerDO server) {
@@ -404,6 +424,17 @@ public class McpServerService {
             return null;
         }
         return value.trim();
+    }
+
+    private String trimToLength(String value, int maxLength) {
+        String trimmed = trimToNull(value);
+        if (trimmed == null) {
+            return null;
+        }
+        if (maxLength <= 0 || trimmed.length() <= maxLength) {
+            return trimmed;
+        }
+        return trimmed.substring(0, maxLength);
     }
 
     private String trimUpperToNull(String value) {

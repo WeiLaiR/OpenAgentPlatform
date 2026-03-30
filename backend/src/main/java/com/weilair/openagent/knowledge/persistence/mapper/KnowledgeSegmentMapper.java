@@ -8,6 +8,7 @@ import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 @Mapper
 public interface KnowledgeSegmentMapper {
@@ -79,6 +80,36 @@ public interface KnowledgeSegmentMapper {
             @Param("keyword") String keyword,
             @Param("limit") int limit
     );
+
+    @Select("""
+            SELECT
+              id,
+              knowledge_base_id,
+              file_id,
+              segment_no,
+              text_preview,
+              full_text,
+              token_count,
+              page_no,
+              source_title,
+              source_path,
+              metadata_json,
+              milvus_primary_key,
+              created_at
+            FROM knowledge_segment
+            WHERE id = #{segmentId}
+            """)
+    KnowledgeSegmentDO selectById(@Param("segmentId") Long segmentId);
+
+    @Update("""
+            UPDATE knowledge_segment
+            SET text_preview = #{textPreview},
+                full_text = #{fullText},
+                token_count = #{tokenCount},
+                metadata_json = #{metadataJson}
+            WHERE id = #{id}
+            """)
+    int updateEditableFields(KnowledgeSegmentDO segment);
 
     @Delete("""
             DELETE FROM knowledge_segment

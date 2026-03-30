@@ -1,6 +1,7 @@
 package com.weilair.openagent.memory.persistence.mapper;
 
 import com.weilair.openagent.memory.model.ChatMemorySessionDO;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Options;
@@ -28,6 +29,24 @@ public interface ChatMemorySessionMapper {
             LIMIT 1
             """)
     ChatMemorySessionDO selectByMemoryId(@Param("memoryId") String memoryId);
+
+    @Select("""
+            SELECT
+              id,
+              conversation_id,
+              memory_id,
+              memory_type,
+              max_messages,
+              max_tokens,
+              tokenizer_name,
+              status,
+              created_at,
+              updated_at
+            FROM chat_memory_session
+            WHERE conversation_id = #{conversationId}
+            LIMIT 1
+            """)
+    ChatMemorySessionDO selectByConversationId(@Param("conversationId") Long conversationId);
 
     @Insert("""
             INSERT IGNORE INTO chat_memory_session (
@@ -62,4 +81,10 @@ public interface ChatMemorySessionMapper {
             WHERE id = #{id}
             """)
     int updateMetadata(ChatMemorySessionDO session);
+
+    @Delete("""
+            DELETE FROM chat_memory_session
+            WHERE conversation_id = #{conversationId}
+            """)
+    int deleteByConversationId(@Param("conversationId") Long conversationId);
 }
