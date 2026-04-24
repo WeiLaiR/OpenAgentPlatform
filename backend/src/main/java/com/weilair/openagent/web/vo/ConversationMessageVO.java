@@ -8,6 +8,7 @@ public record ConversationMessageVO(
         String content,
         String requestId,
         String finishReason,
-        Long createdAt
+        Long createdAt,
+        ToolConfirmationPendingVO pendingConfirmation
 ) {
 }

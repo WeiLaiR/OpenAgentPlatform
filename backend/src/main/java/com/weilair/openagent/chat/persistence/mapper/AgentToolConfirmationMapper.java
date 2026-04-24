@@ -119,6 +119,37 @@ public interface AgentToolConfirmationMapper {
               updated_at
             FROM agent_tool_confirmation
             WHERE conversation_id = #{conversationId}
+            ORDER BY created_at ASC, id ASC
+            """)
+    List<AgentToolConfirmationDO> selectByConversationId(@Param("conversationId") Long conversationId);
+
+    @Select("""
+            SELECT
+              id,
+              request_id,
+              continuation_request_id,
+              conversation_id,
+              user_message_id,
+              mode_code,
+              memory_enabled,
+              knowledge_base_ids_json,
+              mcp_server_ids_json,
+              user_message_text,
+              tool_call_id,
+              tool_name,
+              tool_arguments_json,
+              tool_title,
+              server_name,
+              risk_level,
+              status_code,
+              decision_reason,
+              decision_at,
+              executed_at,
+              expires_at,
+              created_at,
+              updated_at
+            FROM agent_tool_confirmation
+            WHERE conversation_id = #{conversationId}
               AND status_code = 'PENDING'
             ORDER BY created_at DESC, id DESC
             """)

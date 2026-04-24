@@ -36,9 +36,11 @@ import com.weilair.openagent.chat.model.ChatStreamSession;
 import com.weilair.openagent.chat.model.AgentToolConfirmationDO;
 import com.weilair.openagent.chat.service.AgentAiServiceFactory.StreamingAgentAssistant;
 import com.weilair.openagent.chat.service.AgentAiServiceFactory.SyncAgentAssistant;
+import com.weilair.openagent.chat.service.AgentToolConfirmationService.ToolConfirmationDecision;
 import com.weilair.openagent.chat.service.RagRuntimeResolver.RagAugmentationResult;
 import com.weilair.openagent.chat.service.RagRuntimeResolver.RagRuntime;
 import com.weilair.openagent.chat.service.ToolRuntimeResolver.ResolvedToolRuntime;
+import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.common.request.RequestIdContext;
 import com.weilair.openagent.conversation.model.ConversationDO;
 import com.weilair.openagent.conversation.model.ConversationMessageDO;
@@ -218,6 +220,7 @@ public class ChatOrchestrator {
             );
         } catch (ToolConfirmationRequiredException exception) {
             long elapsedMillis = System.currentTimeMillis() - startedAt;
+            persistPendingConfirmationMessage(outputPort, exception.pendingConfirmation());
             outputPort.emitMessageEnd("", "tool_confirmation_required", exception.pendingConfirmation());
             outputPort.complete();
             return new ChatAnswerVO(
@@ -314,9 +317,19 @@ public class ChatOrchestrator {
         outputPort.userMessageId(originalConfirmation.getUserMessageId());
         outputPort.emitStarted();
 
-        AgentToolConfirmationDO confirmation = approved
+        ToolConfirmationDecision decision = approved
                 ? agentToolConfirmationService.approve(confirmationId, outputPort.requestId())
                 : agentToolConfirmationService.reject(confirmationId, outputPort.requestId());
+        AgentToolConfirmationDO confirmation = decision.confirmation();
+        if (decision.reusedExistingContinuation()) {
+            sessionStore.remove(outputPort.requestId());
+            return new ChatRequestAcceptedVO(
+                    confirmation.getContinuationRequestId(),
+                    confirmation.getConversationId(),
+                    "ACCEPTED",
+                    TimeUtils.toEpochMillis(confirmation.getDecisionAt())
+            );
+        }
 
         tracePublisher.append(
                 outputPort,
@@ -616,8 +629,30 @@ public class ChatOrchestrator {
             ChatOutputPort outputPort,
             ToolConfirmationPendingVO pendingConfirmation
     ) {
+        persistPendingConfirmationMessage(outputPort, pendingConfirmation);
         outputPort.emitMessageEnd("", "tool_confirmation_required", pendingConfirmation);
         outputPort.complete();
+    }
+
+    /**
+     * 高风险工具进入待确认时，也要把 assistant 占位消息写入 history。
+     * 否则页面刷新后虽然能查到 confirmation 记录，但会缺少这轮 assistant 在消息流里的固定落点。
+     */
+    private void persistPendingConfirmationMessage(
+            ChatOutputPort outputPort,
+            ToolConfirmationPendingVO pendingConfirmation
+    ) {
+        if (pendingConfirmation == null) {
+            return;
+        }
+        conversationService.saveAssistantMessage(
+                outputPort.conversationId(),
+                outputPort.requestId(),
+                outputPort.userMessageId(),
+                "",
+                "tool_confirmation_required",
+                null
+        );
     }
 
     private List<ToolExecutionResultMessage> executeContinuationToolRequests(

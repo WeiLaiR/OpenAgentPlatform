@@ -77,6 +77,7 @@ const traceExpandedIds = ref<number[]>([])
 const settingsDrawerVisible = ref(false)
 const traceDialogVisible = ref(false)
 const traceDialogLoading = ref(false)
+const toolConfirmationLoadingId = ref<number | null>(null)
 const chatHistoryRef = ref<HTMLElement | null>(null)
 const chatInputRef = ref<{ focus: () => void } | null>(null)
 const chatAutoScrollPinned = ref(true)
@@ -825,11 +826,12 @@ async function handleToolConfirmation(
   decision: 'approve' | 'reject',
 ) {
   const pendingConfirmation = message.pendingConfirmation
-  if (!pendingConfirmation || chatLoading.value) {
+  if (!pendingConfirmation || chatLoading.value || toolConfirmationLoadingId.value === pendingConfirmation.id) {
     return
   }
 
   chatLoading.value = true
+  toolConfirmationLoadingId.value = pendingConfirmation.id
   chatError.value = ''
 
   try {
@@ -856,13 +858,23 @@ async function handleToolConfirmation(
     }
   } catch (error) {
     chatError.value = error instanceof RequestError ? error.message : '工具确认续跑失败。'
-    if (message.uiState !== 'error') {
+    let refreshed = false
+    if (activeConversationId.value) {
+      try {
+        await refreshAfterRound(activeConversationId.value, null)
+        refreshed = true
+      } catch {
+        refreshed = false
+      }
+    }
+    if (!refreshed && message.uiState !== 'error') {
       message.uiState = 'pending_confirmation'
       message.pendingConfirmation = pendingConfirmation
       message.progressMessage = undefined
     }
   } finally {
     chatLoading.value = false
+    toolConfirmationLoadingId.value = null
     await focusChatInput()
   }
 }
@@ -880,6 +892,45 @@ function formatPendingConfirmationLabel(pendingConfirmation?: ToolConfirmationPe
     return '高风险工具'
   }
   return pendingConfirmation.toolTitle || pendingConfirmation.toolName
+}
+
+function isPendingConfirmationActionable(pendingConfirmation?: ToolConfirmationPending) {
+  return pendingConfirmation?.status === 'PENDING'
+}
+
+function formatToolConfirmationTitle(pendingConfirmation?: ToolConfirmationPending) {
+  const label = formatPendingConfirmationLabel(pendingConfirmation)
+  const status = pendingConfirmation?.status ?? 'PENDING'
+  if (status === 'APPROVED') {
+    return `${label} 已确认`
+  }
+  if (status === 'REJECTED') {
+    return `${label} 已拒绝`
+  }
+  if (status === 'EXECUTED') {
+    return `${label} 已执行`
+  }
+  if (status === 'FAILED') {
+    return `${label} 执行失败`
+  }
+  if (status === 'EXPIRED') {
+    return `${label} 已过期`
+  }
+  return `${label} 需要确认`
+}
+
+function toolConfirmationBlockClass(pendingConfirmation?: ToolConfirmationPending) {
+  const status = pendingConfirmation?.status ?? 'PENDING'
+  if (status === 'APPROVED' || status === 'EXECUTED') {
+    return 'pending-confirmation-block--resolved'
+  }
+  if (status === 'FAILED' || status === 'EXPIRED') {
+    return 'pending-confirmation-block--failed'
+  }
+  if (status === 'REJECTED') {
+    return 'pending-confirmation-block--rejected'
+  }
+  return ''
 }
 
 function clearAssistantMarkdownRenderTimer(messageId: number) {
@@ -1120,7 +1171,14 @@ function normalizeMessages(
 ) {
   const normalized: ConversationMessage[] = records.map((item) => ({
     ...item,
-    uiState: item.roleCode === 'ASSISTANT' ? ('done' as const) : undefined,
+    uiState:
+      item.roleCode === 'ASSISTANT' && item.finishReason === 'tool_confirmation_required'
+        ? item.pendingConfirmation?.status === 'PENDING'
+          ? ('pending_confirmation' as const)
+          : ('done' as const)
+        : item.roleCode === 'ASSISTANT'
+          ? ('done' as const)
+          : undefined,
     renderedContentHtml:
       item.roleCode === 'ASSISTANT' && item.content ? renderMarkdownToHtml(item.content) : undefined,
     renderCacheKey: item.roleCode === 'ASSISTANT' ? item.content : undefined,
@@ -1738,12 +1796,17 @@ onBeforeUnmount(() => {
             <p v-else-if="message.content">{{ message.content }}</p>
             <div
               v-else-if="
-                message.roleCode === 'ASSISTANT' && message.uiState === 'pending_confirmation'
+                message.roleCode === 'ASSISTANT' &&
+                message.finishReason === 'tool_confirmation_required' &&
+                message.pendingConfirmation
               "
-              class="pending-confirmation-block"
+              :class="[
+                'pending-confirmation-block',
+                toolConfirmationBlockClass(message.pendingConfirmation),
+              ]"
             >
               <p class="pending-confirmation-block__title">
-                {{ formatPendingConfirmationLabel(message.pendingConfirmation) }} 需要确认
+                {{ formatToolConfirmationTitle(message.pendingConfirmation) }}
               </p>
               <p class="pending-confirmation-block__desc">
                 {{ message.pendingConfirmation?.statusMessage || '当前工具调用已被风险策略拦截。' }}
@@ -1755,19 +1818,27 @@ onBeforeUnmount(() => {
                 <span v-if="message.pendingConfirmation?.riskLevel">
                   风险等级: {{ message.pendingConfirmation.riskLevel }}
                 </span>
+                <span v-if="message.pendingConfirmation?.expiresAt">
+                  过期时间: {{ formatTime(message.pendingConfirmation.expiresAt) }}
+                </span>
               </div>
-              <div class="pending-confirmation-block__actions">
+              <div
+                v-if="isPendingConfirmationActionable(message.pendingConfirmation)"
+                class="pending-confirmation-block__actions"
+              >
                 <el-button
                   type="primary"
                   size="small"
-                  :disabled="chatLoading"
+                  :disabled="chatLoading || toolConfirmationLoadingId === message.pendingConfirmation?.id"
+                  :loading="toolConfirmationLoadingId === message.pendingConfirmation?.id"
                   @click="handleApproveToolConfirmation(message)"
                 >
                   确认执行
                 </el-button>
                 <el-button
                   size="small"
-                  :disabled="chatLoading"
+                  :disabled="chatLoading || toolConfirmationLoadingId === message.pendingConfirmation?.id"
+                  :loading="toolConfirmationLoadingId === message.pendingConfirmation?.id"
                   @click="handleRejectToolConfirmation(message)"
                 >
                   拒绝执行
@@ -2951,6 +3022,42 @@ onBeforeUnmount(() => {
   border-radius: 16px;
   background: rgba(255, 247, 237, 0.92);
   border: 1px solid rgba(249, 115, 22, 0.2);
+}
+
+.pending-confirmation-block--resolved {
+  background: rgba(236, 253, 245, 0.92);
+  border-color: rgba(16, 185, 129, 0.18);
+}
+
+.pending-confirmation-block--resolved .pending-confirmation-block__title,
+.pending-confirmation-block--resolved .pending-confirmation-block__meta {
+  color: #166534;
+}
+
+.pending-confirmation-block--resolved .pending-confirmation-block__desc {
+  color: #166534;
+}
+
+.pending-confirmation-block--rejected {
+  background: rgba(239, 246, 255, 0.92);
+  border-color: rgba(59, 130, 246, 0.18);
+}
+
+.pending-confirmation-block--rejected .pending-confirmation-block__title,
+.pending-confirmation-block--rejected .pending-confirmation-block__meta,
+.pending-confirmation-block--rejected .pending-confirmation-block__desc {
+  color: #1d4ed8;
+}
+
+.pending-confirmation-block--failed {
+  background: rgba(254, 242, 242, 0.92);
+  border-color: rgba(239, 68, 68, 0.18);
+}
+
+.pending-confirmation-block--failed .pending-confirmation-block__title,
+.pending-confirmation-block--failed .pending-confirmation-block__meta,
+.pending-confirmation-block--failed .pending-confirmation-block__desc {
+  color: #991b1b;
 }
 
 .pending-confirmation-block__title {

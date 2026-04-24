@@ -3,9 +3,13 @@ package com.weilair.openagent.conversation.service;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import com.weilair.openagent.ai.config.OpenAgentMemoryProperties;
+import com.weilair.openagent.chat.service.AgentToolConfirmationService;
 import com.weilair.openagent.chat.persistence.mapper.AgentToolConfirmationMapper;
 import com.weilair.openagent.chat.model.ChatMode;
 import com.weilair.openagent.common.util.TimeUtils;
@@ -31,6 +35,7 @@ import com.weilair.openagent.web.dto.ConversationSettingsUpdateRequest;
 import com.weilair.openagent.web.vo.ConversationMemoryClearVO;
 import com.weilair.openagent.web.vo.ConversationMessageVO;
 import com.weilair.openagent.web.vo.ConversationVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -51,6 +56,7 @@ public class ConversationService {
     private final KnowledgeBaseService knowledgeBaseService;
     private final McpServerService mcpServerService;
     private final ConversationMemoryService conversationMemoryService;
+    private final AgentToolConfirmationService agentToolConfirmationService;
     private final ChatMemorySessionMapper chatMemorySessionMapper;
     private final ChatMemoryMessageMapper chatMemoryMessageMapper;
     private final TraceEventMapper traceEventMapper;
@@ -65,6 +71,7 @@ public class ConversationService {
             KnowledgeBaseService knowledgeBaseService,
             McpServerService mcpServerService,
             ConversationMemoryService conversationMemoryService,
+            AgentToolConfirmationService agentToolConfirmationService,
             ChatMemorySessionMapper chatMemorySessionMapper,
             ChatMemoryMessageMapper chatMemoryMessageMapper,
             TraceEventMapper traceEventMapper,
@@ -78,6 +85,7 @@ public class ConversationService {
         this.knowledgeBaseService = knowledgeBaseService;
         this.mcpServerService = mcpServerService;
         this.conversationMemoryService = conversationMemoryService;
+        this.agentToolConfirmationService = agentToolConfirmationService;
         this.chatMemorySessionMapper = chatMemorySessionMapper;
         this.chatMemoryMessageMapper = chatMemoryMessageMapper;
         this.traceEventMapper = traceEventMapper;
@@ -149,8 +157,21 @@ public class ConversationService {
 
     public List<ConversationMessageVO> listMessages(Long conversationId) {
         requireConversation(conversationId);
+        Map<String, ToolConfirmationPendingVO> confirmationsByRequestId = agentToolConfirmationService
+                .listByConversationId(conversationId)
+                .stream()
+                .collect(Collectors.toMap(
+                        ToolConfirmationPendingVO::requestId,
+                        Function.identity(),
+                        (left, right) -> right
+                ));
         return conversationMessageMapper.selectByConversationId(conversationId, DEFAULT_MESSAGE_LIMIT).stream()
-                .map(this::toConversationMessageVO)
+                .map(message -> toConversationMessageVO(
+                        message,
+                        "ASSISTANT".equalsIgnoreCase(message.getRoleCode())
+                                ? confirmationsByRequestId.get(message.getRequestId())
+                                : null
+                ))
                 .toList();
     }
 
@@ -307,7 +328,10 @@ public class ConversationService {
         );
     }
 
-    private ConversationMessageVO toConversationMessageVO(ConversationMessageDO message) {
+    private ConversationMessageVO toConversationMessageVO(
+            ConversationMessageDO message,
+            ToolConfirmationPendingVO pendingConfirmation
+    ) {
         return new ConversationMessageVO(
                 message.getId(),
                 message.getConversationId(),
@@ -316,7 +340,8 @@ public class ConversationService {
                 message.getContent(),
                 message.getRequestId(),
                 message.getFinishReason(),
-                TimeUtils.toEpochMillis(message.getCreatedAt())
+                TimeUtils.toEpochMillis(message.getCreatedAt()),
+                pendingConfirmation
         );
     }
 

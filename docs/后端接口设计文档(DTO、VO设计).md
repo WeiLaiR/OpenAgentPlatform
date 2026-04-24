@@ -455,12 +455,14 @@ data: {
 - 作用：确认执行已记录的高风险工具请求。
 - 返回：`ApiResponse<ChatRequestAcceptedVO>`
 - 说明：后端不会重新让模型生成 tool call，而是继续执行已记录的 `tool request`，并开启新的 continuation `requestId` 供聊天 SSE / Trace SSE 订阅。
+- 说明：如果同一条确认记录被重复点击“确认执行”，后端会优先复用已有 `continuationRequestId`，不会重复启动一条新的续跑链路。
 
 #### `POST /api/v1/chat/tool-confirmations/{confirmationId}/reject`
 
 - 作用：拒绝执行已记录的高风险工具请求。
 - 返回：`ApiResponse<ChatRequestAcceptedVO>`
 - 说明：后端会构造结构化 `USER_REJECTED` tool result 回送模型，继续完成这一轮自然语言回答。
+- 说明：如果同一条确认记录被重复点击“拒绝执行”，后端会优先复用已有 `continuationRequestId`，不会重复启动一条新的续跑链路。
 
 #### `GET /api/v1/chat/tool-confirmations/pending?conversationId={conversationId}`
 
@@ -493,14 +495,19 @@ public class ConversationMessageVO {
     private String roleCode;
     private String messageType;
     private String content;
-    private Object contentJson;
-    private Integer tokenCount;
-    private String modelName;
+    private String requestId;
     private String finishReason;
-    private Long parentMessageId;
     private Long createdAt;
+    private ToolConfirmationPendingVO pendingConfirmation;
 }
 ```
+
+### 说明
+
+- 当某条 assistant 消息对应高风险工具确认链路时，`pendingConfirmation` 会返回该轮工具确认的当前状态。
+- `pendingConfirmation.status` 不只会是 `PENDING`，也可能是 `APPROVED / REJECTED / EXECUTED / FAILED / EXPIRED`，用于页面刷新后的状态回放。
+- `finishReason = tool_confirmation_required` 的 assistant 消息会作为会话历史中的固定占位节点持久化保存。
+- 当前端因为重复点击或刷新后的并发操作再次提交同一决策时，后端会复用已有 `continuationRequestId` 或返回明确状态错误，前端应主动刷新会话消息以和数据库状态对齐。
 
 ### 返回
 

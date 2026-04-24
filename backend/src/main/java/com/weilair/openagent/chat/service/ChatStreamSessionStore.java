@@ -80,6 +80,17 @@ public class ChatStreamSessionStore {
         return session;
     }
 
+    /**
+     * 当上层因为重复确认改为复用已有 continuation 时，
+     * 需要把这次未真正投入执行的空会话移除，避免残留在内存索引里。
+     */
+    public void remove(String requestId) {
+        if (requestId == null || requestId.isBlank()) {
+            return;
+        }
+        sessions.remove(requestId);
+    }
+
     public SseEmitter connect(String requestId) {
         // 先确认 requestId 对应的流式任务确实存在。
         ChatStreamSession session = getRequired(requestId);
