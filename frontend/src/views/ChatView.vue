@@ -14,13 +14,17 @@ import {
   updateConversationSettings,
 } from '@/api/conversation'
 import {
+  approveToolConfirmation,
+  rejectToolConfirmation,
   submitChat,
   sendChatSync,
   type ChatSendRequest,
+  type ChatRequestAccepted,
   type StreamCompletedEvent,
   type StreamErrorEvent,
   type StreamProgressEvent,
   type StreamTokenEvent,
+  type ToolConfirmationPending,
 } from '@/api/chat'
 import { RequestError } from '@/api/http'
 import { listKnowledgeBases, type KnowledgeBase } from '@/api/knowledge'
@@ -568,9 +572,15 @@ async function handleSend() {
     window.setTimeout(() => {
       openTraceStream(accepted.requestId)
     }, 0)
-    await chatStreamPromise
-    await refreshAfterRound(accepted.conversationId, accepted.requestId)
-    if (shouldRefreshGeneratedTitle && accepted.conversationId) {
+    const streamResult = await chatStreamPromise
+    if (streamResult.finishReason !== 'tool_confirmation_required') {
+      await refreshAfterRound(accepted.conversationId, accepted.requestId)
+    }
+    if (
+      streamResult.finishReason !== 'tool_confirmation_required' &&
+      shouldRefreshGeneratedTitle &&
+      accepted.conversationId
+    ) {
       scheduleGeneratedTitleRefresh(accepted.conversationId)
     }
   } catch (error) {
@@ -627,7 +637,10 @@ function buildChatRequest(message: string): ChatSendRequest {
   return request
 }
 
-function openChatStream(streamRequestId: string, assistantMessageId: number): Promise<void> {
+function openChatStream(
+  streamRequestId: string,
+  assistantMessageId: number,
+): Promise<StreamCompletedEvent> {
   return new Promise((resolve, reject) => {
     activeChatSource = new EventSource(`/api/v1/chat/stream/${streamRequestId}`)
 
@@ -643,10 +656,10 @@ function openChatStream(streamRequestId: string, assistantMessageId: number): Pr
 
     activeChatSource.addEventListener('message_end', (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as StreamCompletedEvent
-      completeAssistantMessage(assistantMessageId, streamRequestId, payload.answer)
+      completeAssistantMessage(assistantMessageId, streamRequestId, payload)
       activeChatSource?.close()
       activeChatSource = null
-      resolve()
+      resolve(payload)
     })
 
     activeChatSource.addEventListener('error', (event) => {
@@ -705,6 +718,7 @@ function appendAssistantChunk(assistantMessageId: number, streamRequestId: strin
     existing.content = `${existing.content ?? ''}${content}`
     existing.uiState = 'streaming'
     existing.progressMessage = undefined
+    existing.pendingConfirmation = undefined
     scheduleAssistantMarkdownRender(existing)
     return
   }
@@ -719,6 +733,7 @@ function appendAssistantChunk(assistantMessageId: number, streamRequestId: strin
     finishReason: null,
     createdAt: Date.now(),
     uiState: 'streaming',
+    pendingConfirmation: undefined,
   }
 
   messages.value = [
@@ -728,14 +743,29 @@ function appendAssistantChunk(assistantMessageId: number, streamRequestId: strin
   scheduleAssistantMarkdownRender(assistantMessage)
 }
 
-function completeAssistantMessage(assistantMessageId: number, streamRequestId: string, answer: string) {
+function completeAssistantMessage(
+  assistantMessageId: number,
+  streamRequestId: string,
+  payload: StreamCompletedEvent,
+) {
   const target = messages.value.find((item) => item.id === assistantMessageId)
   if (target) {
     target.requestId = streamRequestId
-    target.content = answer
-    target.finishReason = 'stop'
-    target.uiState = 'done'
+    target.finishReason = payload.finishReason
     target.progressMessage = undefined
+
+    if (payload.finishReason === 'tool_confirmation_required' && payload.pendingConfirmation) {
+      target.content = ''
+      target.uiState = 'pending_confirmation'
+      target.pendingConfirmation = payload.pendingConfirmation
+      target.renderedContentHtml = ''
+      target.renderCacheKey = ''
+      return
+    }
+
+    target.content = payload.answer
+    target.uiState = 'done'
+    target.pendingConfirmation = undefined
     renderAssistantMarkdownImmediately(target)
   }
 }
@@ -746,6 +776,7 @@ function markAssistantMessageError(assistantMessageId: number, streamRequestId: 
     target.requestId = streamRequestId
     target.content = '请求失败。'
     target.uiState = 'error'
+    target.pendingConfirmation = undefined
     renderAssistantMarkdownImmediately(target)
   }
 }
@@ -765,9 +796,88 @@ function updateAssistantProgress(
   target.requestId = streamRequestId
   target.uiState = 'thinking'
   target.progressMessage = payload.message
+  target.pendingConfirmation = undefined
   if (!target.thinkingStartedAt) {
     target.thinkingStartedAt = Date.now() - payload.elapsedMillis
   }
+}
+
+function prepareAssistantMessageForContinuation(
+  message: ConversationMessage,
+  accepted: ChatRequestAccepted,
+  progressMessage: string,
+) {
+  message.requestId = accepted.requestId
+  message.finishReason = null
+  message.content = ''
+  message.uiState = 'thinking'
+  message.progressMessage = progressMessage
+  message.pendingConfirmation = undefined
+  message.thinkingStartedAt = Date.now()
+  message.renderedContentHtml = ''
+  message.renderCacheKey = ''
+}
+
+async function handleToolConfirmation(
+  message: ConversationMessage,
+  decision: 'approve' | 'reject',
+) {
+  const pendingConfirmation = message.pendingConfirmation
+  if (!pendingConfirmation || chatLoading.value) {
+    return
+  }
+
+  chatLoading.value = true
+  chatError.value = ''
+
+  try {
+    closeStreams()
+    const accepted =
+      decision === 'approve'
+        ? await approveToolConfirmation(pendingConfirmation.id)
+        : await rejectToolConfirmation(pendingConfirmation.id)
+    activeChatRequestId.value = accepted.requestId
+    prepareAssistantMessageForContinuation(
+      message,
+      accepted,
+      decision === 'approve'
+        ? '已确认继续执行工具，正在生成本轮回复…'
+        : '已拒绝工具调用，正在生成本轮回复…',
+    )
+    const chatStreamPromise = openChatStream(accepted.requestId, message.id)
+    window.setTimeout(() => {
+      openTraceStream(accepted.requestId)
+    }, 0)
+    const streamResult = await chatStreamPromise
+    if (streamResult.finishReason !== 'tool_confirmation_required') {
+      await refreshAfterRound(accepted.conversationId, accepted.requestId)
+    }
+  } catch (error) {
+    chatError.value = error instanceof RequestError ? error.message : '工具确认续跑失败。'
+    if (message.uiState !== 'error') {
+      message.uiState = 'pending_confirmation'
+      message.pendingConfirmation = pendingConfirmation
+      message.progressMessage = undefined
+    }
+  } finally {
+    chatLoading.value = false
+    await focusChatInput()
+  }
+}
+
+async function handleApproveToolConfirmation(message: ConversationMessage) {
+  await handleToolConfirmation(message, 'approve')
+}
+
+async function handleRejectToolConfirmation(message: ConversationMessage) {
+  await handleToolConfirmation(message, 'reject')
+}
+
+function formatPendingConfirmationLabel(pendingConfirmation?: ToolConfirmationPending) {
+  if (!pendingConfirmation) {
+    return '高风险工具'
+  }
+  return pendingConfirmation.toolTitle || pendingConfirmation.toolName
 }
 
 function clearAssistantMarkdownRenderTimer(messageId: number) {
@@ -1086,6 +1196,15 @@ function traceTitle(trace: TraceEvent) {
   if (trace.eventType === 'TOOL_EXECUTION_REQUESTED') {
     return '开始调用工具'
   }
+  if (trace.eventType === 'TOOL_RISK_EVALUATED') {
+    return '工具风控判定完成'
+  }
+  if (trace.eventType === 'TOOL_CONFIRMATION_REQUIRED') {
+    return '工具需要人工确认'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_BLOCKED') {
+    return '工具执行已阻断'
+  }
   if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
     return '工具调用完成'
   }
@@ -1119,6 +1238,15 @@ function traceDescription(trace: TraceEvent) {
   }
   if (trace.eventType === 'TOOL_EXECUTION_REQUESTED') {
     return '模型已输出 Tool Call，后端正在通过 LangChain4j 官方 ToolExecutor 执行对应 MCP 工具。'
+  }
+  if (trace.eventType === 'TOOL_RISK_EVALUATED') {
+    return '平台已经根据工具快照里的风险等级和运行时状态，完成本次工具调用的统一风控判定。'
+  }
+  if (trace.eventType === 'TOOL_CONFIRMATION_REQUIRED') {
+    return '当前工具被识别为高风险工具，第一版运行时不会直接执行，而是先按“需要确认”处理。'
+  }
+  if (trace.eventType === 'TOOL_EXECUTION_BLOCKED') {
+    return '当前工具调用已被平台策略直接阻断，不会真正落到 MCP 工具执行。'
   }
   if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
     return '工具执行结果已经回填给模型，后续会继续进入下一轮生成。'
@@ -1231,10 +1359,42 @@ function traceFacts(trace: TraceEvent) {
     ]
   }
 
+  if (trace.eventType === 'TOOL_RISK_EVALUATED') {
+    return [
+      { label: '工具名', value: formatScalar(payload.toolName) },
+      { label: '风险等级', value: formatScalar(payload.riskLevel) },
+      { label: '决策', value: formatScalar(payload.decision) },
+      { label: '判定原因', value: formatScalar(payload.reason) },
+      { label: 'Server', value: formatScalar(payload.serverName) },
+    ]
+  }
+
+  if (trace.eventType === 'TOOL_CONFIRMATION_REQUIRED') {
+    return [
+      { label: '工具名', value: formatScalar(payload.toolName) },
+      { label: '风险等级', value: formatScalar(payload.riskLevel) },
+      { label: '决策', value: formatScalar(payload.decision) },
+      { label: '判定原因', value: formatScalar(payload.reason) },
+      { label: '参数预览', value: formatScalar(payload.arguments) },
+    ]
+  }
+
+  if (trace.eventType === 'TOOL_EXECUTION_BLOCKED') {
+    return [
+      { label: '工具名', value: formatScalar(payload.toolName) },
+      { label: '风险等级', value: formatScalar(payload.riskLevel) },
+      { label: '决策', value: formatScalar(payload.decision) },
+      { label: '判定原因', value: formatScalar(payload.reason) },
+      { label: 'Server', value: formatScalar(payload.serverName) },
+    ]
+  }
+
   if (trace.eventType === 'TOOL_EXECUTION_COMPLETED') {
     return [
       { label: '工具名', value: formatScalar(payload.toolName) },
       { label: '调用 ID', value: formatScalar(payload.toolCallId) },
+      { label: '风险等级', value: formatScalar(payload.riskLevel) },
+      { label: '决策', value: formatScalar(payload.decision) },
       { label: '模型轮次', value: formatScalar(payload.modelRound) },
       { label: '是否错误', value: formatScalar(payload.isError) },
       { label: '耗时', value: trace.costMillis ? `${trace.costMillis} ms` : '未记录' },
@@ -1268,6 +1428,9 @@ function isStructuredTrace(trace: TraceEvent) {
     'AGENT_TOOLS_ATTACHED',
     'AGENT_TOOLS_UNAVAILABLE',
     'TOOL_EXECUTION_REQUESTED',
+    'TOOL_RISK_EVALUATED',
+    'TOOL_CONFIRMATION_REQUIRED',
+    'TOOL_EXECUTION_BLOCKED',
     'TOOL_EXECUTION_COMPLETED',
   ].includes(trace.eventType)
 }
@@ -1538,6 +1701,44 @@ onBeforeUnmount(() => {
               v-html="message.renderedContentHtml || ''"
             ></div>
             <p v-else-if="message.content">{{ message.content }}</p>
+            <div
+              v-else-if="
+                message.roleCode === 'ASSISTANT' && message.uiState === 'pending_confirmation'
+              "
+              class="pending-confirmation-block"
+            >
+              <p class="pending-confirmation-block__title">
+                {{ formatPendingConfirmationLabel(message.pendingConfirmation) }} 需要确认
+              </p>
+              <p class="pending-confirmation-block__desc">
+                {{ message.pendingConfirmation?.statusMessage || '当前工具调用已被风险策略拦截。' }}
+              </p>
+              <div class="pending-confirmation-block__meta">
+                <span v-if="message.pendingConfirmation?.serverName">
+                  Server: {{ message.pendingConfirmation.serverName }}
+                </span>
+                <span v-if="message.pendingConfirmation?.riskLevel">
+                  风险等级: {{ message.pendingConfirmation.riskLevel }}
+                </span>
+              </div>
+              <div class="pending-confirmation-block__actions">
+                <el-button
+                  type="primary"
+                  size="small"
+                  :disabled="chatLoading"
+                  @click="handleApproveToolConfirmation(message)"
+                >
+                  确认执行
+                </el-button>
+                <el-button
+                  size="small"
+                  :disabled="chatLoading"
+                  @click="handleRejectToolConfirmation(message)"
+                >
+                  拒绝执行
+                </el-button>
+              </div>
+            </div>
             <div v-else-if="message.roleCode === 'ASSISTANT' && message.uiState === 'thinking'" class="thinking-block">
               <span class="thinking-dot"></span>
               <span>{{ message.progressMessage || '模型正在思考，请稍候…' }}</span>
@@ -2705,6 +2906,42 @@ onBeforeUnmount(() => {
   margin-top: 8px;
   color: #475569;
   line-height: 1.6;
+}
+
+.pending-confirmation-block {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 247, 237, 0.92);
+  border: 1px solid rgba(249, 115, 22, 0.2);
+}
+
+.pending-confirmation-block__title {
+  margin: 0;
+  font-weight: 700;
+  color: #9a3412;
+}
+
+.pending-confirmation-block__desc {
+  margin: 0;
+  line-height: 1.7;
+  color: #7c2d12;
+}
+
+.pending-confirmation-block__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: #9a3412;
+}
+
+.pending-confirmation-block__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .thinking-dot {

@@ -212,9 +212,15 @@ public class AgentAiServiceFactory {
 
         prompt.append("当前会话可用 MCP 工具列表:\n");
         for (String toolName : toolRuntime.toolNames()) {
-            prompt.append("- ").append(toolName).append("\n");
+            ToolRuntimeToolMetadata metadata = toolRuntime.toolMetadata(toolName);
+            prompt.append("- ").append(toolName);
+            if (metadata != null) {
+                prompt.append(" (riskLevel=").append(metadata.riskLevel().name()).append(")");
+            }
+            prompt.append("\n");
         }
-        prompt.append("只能在这些工具里做选择；如果它们都不适合，就直接基于已有上下文回答。");
+        prompt.append("只能在这些工具里做选择；如果它们都不适合，就直接基于已有上下文回答。\n");
+        prompt.append("其中 HIGH 风险工具在当前第一版运行时会先被平台拦截，不应把未执行成功的工具当作已拿到结果。");
         return prompt.toString().trim();
     }
 

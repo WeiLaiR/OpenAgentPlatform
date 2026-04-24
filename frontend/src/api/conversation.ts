@@ -1,4 +1,5 @@
 import { request } from './http'
+import type { ToolConfirmationPending } from './chat'
 
 export interface Conversation {
   id: number
@@ -43,9 +44,10 @@ export interface ConversationMessage {
   requestId: string | null
   finishReason: string | null
   createdAt: number
-  uiState?: 'thinking' | 'streaming' | 'done' | 'error'
+  uiState?: 'thinking' | 'streaming' | 'pending_confirmation' | 'done' | 'error'
   thinkingStartedAt?: number
   progressMessage?: string
+  pendingConfirmation?: ToolConfirmationPending
   renderedContentHtml?: string
   renderCacheKey?: string
 }

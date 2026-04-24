@@ -6,6 +6,7 @@ import com.weilair.openagent.web.vo.ChatStreamProgressVO;
 import com.weilair.openagent.web.vo.ChatStreamStartedVO;
 import com.weilair.openagent.web.vo.ChatStreamTokenVO;
 import com.weilair.openagent.web.vo.TraceEventVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 
 /**
  * 流式模式当前仍然落在自定义 `ChatStreamSessionStore` 上。
@@ -116,12 +117,12 @@ public class StreamingChatOutputPort implements ChatOutputPort {
     }
 
     @Override
-    public void emitMessageEnd(String answer, String finishReason) {
+    public void emitMessageEnd(String answer, String finishReason, ToolConfirmationPendingVO pendingConfirmation) {
         this.finishReason = finishReason == null || finishReason.isBlank() ? "stop" : finishReason;
         sessionStore.appendEvent(
                 session,
                 "message_end",
-                new ChatStreamCompletedVO(session.requestId(), answer, this.finishReason)
+                new ChatStreamCompletedVO(session.requestId(), answer, this.finishReason, pendingConfirmation)
         );
     }
 

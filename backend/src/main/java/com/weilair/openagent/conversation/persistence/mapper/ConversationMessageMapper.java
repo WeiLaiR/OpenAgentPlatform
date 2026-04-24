@@ -82,17 +82,27 @@ public interface ConversationMessageMapper {
             FROM conversation_message cm
             INNER JOIN (
               SELECT
-                request_id
+                CASE
+                  WHEN role_code = 'USER' THEN CAST(id AS CHAR)
+                  ELSE CAST(parent_message_id AS CHAR)
+                END AS turn_key
               FROM conversation_message
               WHERE conversation_id = #{conversationId}
-                AND request_id IS NOT NULL
-              GROUP BY request_id
+                AND role_code IN ('USER', 'ASSISTANT')
+                AND message_type = 'TEXT'
+              GROUP BY CASE
+                WHEN role_code = 'USER' THEN CAST(id AS CHAR)
+                ELSE CAST(parent_message_id AS CHAR)
+              END
               HAVING SUM(CASE WHEN role_code = 'USER' THEN 1 ELSE 0 END) > 0
                  AND SUM(CASE WHEN role_code = 'ASSISTANT' AND COALESCE(finish_reason, '') <> 'error' THEN 1 ELSE 0 END) > 0
               ORDER BY MAX(created_at) DESC, MAX(id) DESC
               LIMIT #{turnLimit}
             ) recent_turns
-              ON cm.request_id = recent_turns.request_id
+              ON CASE
+                WHEN cm.role_code = 'USER' THEN CAST(cm.id AS CHAR)
+                ELSE CAST(cm.parent_message_id AS CHAR)
+              END = recent_turns.turn_key
             WHERE cm.conversation_id = #{conversationId}
               AND cm.role_code IN ('USER', 'ASSISTANT')
               AND cm.message_type = 'TEXT'

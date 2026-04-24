@@ -13,6 +13,8 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
+import com.weilair.openagent.chat.service.ToolRiskLevel;
+import com.weilair.openagent.chat.service.ToolRuntimeToolMetadata;
 import com.weilair.openagent.mcp.model.McpServerDO;
 import com.weilair.openagent.mcp.model.McpToolSnapshotDO;
 import com.weilair.openagent.mcp.persistence.mapper.McpServerMapper;
@@ -66,9 +68,13 @@ public class McpToolRuntimeService {
         candidateServers.forEach(server -> serverById.put(server.getId(), server));
 
         Map<String, McpToolSnapshotDO> snapshotByServerAndOrigin = new LinkedHashMap<>();
+        Map<String, ToolRuntimeToolMetadata> metadataByRuntimeToolName = new LinkedHashMap<>();
         mcpToolSnapshotMapper.selectList(null, null, 1, DEFAULT_TOOL_LIMIT).stream()
                 .filter(tool -> serverById.containsKey(tool.getMcpServerId()))
-                .forEach(tool -> snapshotByServerAndOrigin.put(runtimeKey(tool.getServerName(), tool.getOriginToolName()), tool));
+                .forEach(tool -> {
+                    snapshotByServerAndOrigin.put(runtimeKey(tool.getServerName(), tool.getOriginToolName()), tool);
+                    metadataByRuntimeToolName.put(tool.getRuntimeToolName(), toToolMetadata(tool, serverById.get(tool.getMcpServerId())));
+                });
 
         if (snapshotByServerAndOrigin.isEmpty()) {
             return McpToolRuntime.empty();
@@ -111,11 +117,25 @@ public class McpToolRuntimeService {
                 return McpToolRuntime.empty();
             }
 
-            return new McpToolRuntime(clients, toolProviderResult);
+            return new McpToolRuntime(clients, toolProviderResult, metadataByRuntimeToolName);
         } catch (Exception exception) {
             closeQuietly(clients);
             throw exception;
         }
+    }
+
+    private ToolRuntimeToolMetadata toToolMetadata(McpToolSnapshotDO tool, McpServerDO server) {
+        return new ToolRuntimeToolMetadata(
+                tool.getId(),
+                server == null ? tool.getMcpServerId() : server.getId(),
+                server == null ? tool.getServerName() : server.getName(),
+                tool.getRuntimeToolName(),
+                tool.getOriginToolName(),
+                tool.getToolTitle(),
+                ToolRiskLevel.fromValue(tool.getRiskLevel()),
+                Boolean.TRUE.equals(tool.getEnabled()),
+                server == null ? null : server.getHealthStatus()
+        );
     }
 
     private String runtimeKey(String serverName, String originToolName) {
@@ -133,22 +153,32 @@ public class McpToolRuntimeService {
     }
 
     public static final class McpToolRuntime implements AutoCloseable {
-        private static final McpToolRuntime EMPTY = new McpToolRuntime(List.of(), ToolProviderResult.builder().build());
+        private static final McpToolRuntime EMPTY = new McpToolRuntime(List.of(), ToolProviderResult.builder().build(), Map.of());
 
         private final List<McpClient> clients;
         private final ToolProviderResult toolProviderResult;
+        private final Map<String, ToolRuntimeToolMetadata> toolMetadataByName;
 
-        private McpToolRuntime(List<McpClient> clients, ToolProviderResult toolProviderResult) {
+        private McpToolRuntime(
+                List<McpClient> clients,
+                ToolProviderResult toolProviderResult,
+                Map<String, ToolRuntimeToolMetadata> toolMetadataByName
+        ) {
             this.clients = clients;
             this.toolProviderResult = toolProviderResult;
+            this.toolMetadataByName = toolMetadataByName == null ? Map.of() : Map.copyOf(toolMetadataByName);
         }
 
         public static McpToolRuntime empty() {
             return EMPTY;
         }
 
-        public static McpToolRuntime of(List<McpClient> clients, ToolProviderResult toolProviderResult) {
-            return new McpToolRuntime(clients, toolProviderResult);
+        public static McpToolRuntime of(
+                List<McpClient> clients,
+                ToolProviderResult toolProviderResult,
+                Map<String, ToolRuntimeToolMetadata> toolMetadataByName
+        ) {
+            return new McpToolRuntime(clients, toolProviderResult, toolMetadataByName);
         }
 
         public boolean hasTools() {
@@ -171,6 +201,18 @@ public class McpToolRuntimeService {
 
         public ToolExecutor toolExecutor(String toolName) {
             return toolProviderResult.toolExecutorByName(toolName);
+        }
+
+        public ToolProviderResult toolProviderResult() {
+            return toolProviderResult;
+        }
+
+        public Map<String, ToolRuntimeToolMetadata> toolMetadataByName() {
+            return toolMetadataByName;
+        }
+
+        public ToolRuntimeToolMetadata toolMetadata(String toolName) {
+            return toolMetadataByName.get(toolName);
         }
 
         /**

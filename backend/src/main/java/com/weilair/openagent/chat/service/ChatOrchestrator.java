@@ -30,8 +30,10 @@ import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.tool.BeforeToolExecution;
 import dev.langchain4j.service.tool.ToolExecution;
 import com.weilair.openagent.chat.prompt.PromptAssembly;
+import com.weilair.openagent.chat.exception.ToolConfirmationRequiredException;
 import com.weilair.openagent.chat.exception.ChatServiceUnavailableException;
 import com.weilair.openagent.chat.model.ChatStreamSession;
+import com.weilair.openagent.chat.model.AgentToolConfirmationDO;
 import com.weilair.openagent.chat.service.AgentAiServiceFactory.StreamingAgentAssistant;
 import com.weilair.openagent.chat.service.AgentAiServiceFactory.SyncAgentAssistant;
 import com.weilair.openagent.chat.service.RagRuntimeResolver.RagAugmentationResult;
@@ -39,13 +41,16 @@ import com.weilair.openagent.chat.service.RagRuntimeResolver.RagRuntime;
 import com.weilair.openagent.chat.service.ToolRuntimeResolver.ResolvedToolRuntime;
 import com.weilair.openagent.common.request.RequestIdContext;
 import com.weilair.openagent.conversation.model.ConversationDO;
+import com.weilair.openagent.conversation.model.ConversationMessageDO;
 import com.weilair.openagent.conversation.service.ConversationService;
 import com.weilair.openagent.conversation.service.ConversationTitleService;
+import com.weilair.openagent.memory.service.ConversationMemoryService;
 import com.weilair.openagent.trace.service.ChatModelObservationContextHolder;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
 import com.weilair.openagent.web.vo.ChatRequestAcceptedVO;
 import com.weilair.openagent.web.vo.RagSnippetVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -74,10 +79,13 @@ public class ChatOrchestrator {
     private final ChatStreamSessionStore sessionStore;
     private final ChatContextAssembler chatContextAssembler;
     private final ConversationService conversationService;
+    private final ConversationMemoryService conversationMemoryService;
     private final ModeResolver modeResolver;
     private final AgentAiServiceFactory agentAiServiceFactory;
     private final RagRuntimeResolver ragRuntimeResolver;
     private final ToolRuntimeResolver toolRuntimeResolver;
+    private final AgentToolRiskGuard agentToolRiskGuard;
+    private final AgentToolConfirmationService agentToolConfirmationService;
     private final TracePublisher tracePublisher;
     private final ConversationTitleService conversationTitleService;
     private final ChatModelObservationContextHolder chatModelObservationContextHolder;
@@ -90,10 +98,13 @@ public class ChatOrchestrator {
             ChatStreamSessionStore sessionStore,
             ChatContextAssembler chatContextAssembler,
             ConversationService conversationService,
+            ConversationMemoryService conversationMemoryService,
             ModeResolver modeResolver,
             AgentAiServiceFactory agentAiServiceFactory,
             RagRuntimeResolver ragRuntimeResolver,
             ToolRuntimeResolver toolRuntimeResolver,
+            AgentToolRiskGuard agentToolRiskGuard,
+            AgentToolConfirmationService agentToolConfirmationService,
             TracePublisher tracePublisher,
             ConversationTitleService conversationTitleService,
             ChatModelObservationContextHolder chatModelObservationContextHolder,
@@ -104,10 +115,13 @@ public class ChatOrchestrator {
         this.sessionStore = sessionStore;
         this.chatContextAssembler = chatContextAssembler;
         this.conversationService = conversationService;
+        this.conversationMemoryService = conversationMemoryService;
         this.modeResolver = modeResolver;
         this.agentAiServiceFactory = agentAiServiceFactory;
         this.ragRuntimeResolver = ragRuntimeResolver;
         this.toolRuntimeResolver = toolRuntimeResolver;
+        this.agentToolRiskGuard = agentToolRiskGuard;
+        this.agentToolConfirmationService = agentToolConfirmationService;
         this.tracePublisher = tracePublisher;
         this.conversationTitleService = conversationTitleService;
         this.chatModelObservationContextHolder = chatModelObservationContextHolder;
@@ -126,9 +140,9 @@ public class ChatOrchestrator {
         String requestId = RequestIdContext.getRequestId();
         ChatOutputPort outputPort = new BufferedChatOutputPort(requestId, conversation.getId());
         executionGuard.acquire(conversation.getId(), requestId);
+        long startedAt = System.currentTimeMillis();
 
         try {
-            long startedAt = System.currentTimeMillis();
             Long userMessageId = conversationService.saveUserMessage(conversation.getId(), outputPort.requestId(), request.message());
             outputPort.userMessageId(userMessageId);
             tracePublisher.append(
@@ -199,7 +213,22 @@ public class ChatOrchestrator {
                     outputPort.finishReason(),
                     !answerResult.ragSnippets().isEmpty(),
                     answerResult.usedTools(),
-                    elapsedMillis
+                    elapsedMillis,
+                    null
+            );
+        } catch (ToolConfirmationRequiredException exception) {
+            long elapsedMillis = System.currentTimeMillis() - startedAt;
+            outputPort.emitMessageEnd("", "tool_confirmation_required", exception.pendingConfirmation());
+            outputPort.complete();
+            return new ChatAnswerVO(
+                    outputPort.requestId(),
+                    conversation.getId(),
+                    "",
+                    "tool_confirmation_required",
+                    executionSpec.ragEnabled(),
+                    false,
+                    elapsedMillis,
+                    exception.pendingConfirmation()
             );
         } finally {
             executionGuard.release(conversation.getId(), requestId);
@@ -270,9 +299,395 @@ public class ChatOrchestrator {
         }
     }
 
+    public ChatRequestAcceptedVO approveToolConfirmation(Long confirmationId) {
+        return continueToolConfirmation(confirmationId, true);
+    }
+
+    public ChatRequestAcceptedVO rejectToolConfirmation(Long confirmationId) {
+        return continueToolConfirmation(confirmationId, false);
+    }
+
+    private ChatRequestAcceptedVO continueToolConfirmation(Long confirmationId, boolean approved) {
+        AgentToolConfirmationDO originalConfirmation = agentToolConfirmationService.requireConfirmation(confirmationId);
+        ChatStreamSession session = sessionStore.create(originalConfirmation.getConversationId());
+        ChatOutputPort outputPort = new StreamingChatOutputPort(sessionStore, session);
+        outputPort.userMessageId(originalConfirmation.getUserMessageId());
+        outputPort.emitStarted();
+
+        AgentToolConfirmationDO confirmation = approved
+                ? agentToolConfirmationService.approve(confirmationId, outputPort.requestId())
+                : agentToolConfirmationService.reject(confirmationId, outputPort.requestId());
+
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                approved ? "TOOL_CONFIRMATION_APPROVED" : "TOOL_CONFIRMATION_REJECTED",
+                "TOOL",
+                Map.of(
+                        "confirmationId", confirmation.getId(),
+                        "originalRequestId", confirmation.getRequestId(),
+                        "toolName", confirmation.getToolName(),
+                        "riskLevel", confirmation.getRiskLevel(),
+                        "decisionReason", confirmation.getDecisionReason()
+                ),
+                approved,
+                null
+        );
+
+        executorService.submit(() -> resumeToolConfirmation(outputPort, confirmation, approved));
+        return new ChatRequestAcceptedVO(
+                outputPort.requestId(),
+                confirmation.getConversationId(),
+                outputPort.status(),
+                session.createdAt()
+        );
+    }
+
+    private void resumeToolConfirmation(
+            ChatOutputPort outputPort,
+            AgentToolConfirmationDO confirmation,
+            boolean approved
+    ) {
+        ConversationDO conversation = conversationService.requireConversation(confirmation.getConversationId());
+        executionGuard.acquire(conversation.getId(), outputPort.requestId());
+        outputPort.markRunning();
+        ChatExecutionSpec executionSpec = agentToolConfirmationService.toExecutionSpec(confirmation, false);
+
+        try (ResolvedToolRuntime toolRuntime = toolRuntimeResolver.openRuntime(
+                conversation.getId(),
+                executionSpec,
+                confirmation.getUserMessageText()
+        )) {
+            List<ChatMessage> historyMessages = buildConversationHistoryMessages(conversation.getId());
+            traceResolvedToolContinuation(outputPort, confirmation, approved);
+            PromptAssembly promptAssembly = agentAiServiceFactory.buildPromptAssembly(toolRuntime);
+            tracePromptAssemblyResolved(
+                    outputPort,
+                    promptAssembly,
+                    promptAssemblyPayload(
+                            promptAssembly,
+                            "TOOL_CONFIRMATION_RESUME",
+                            executionSpec.modeCode(),
+                            Map.of(
+                                    "systemMessageCount", promptAssembly.blocks().size(),
+                                    "historyMessageCount", historyMessages.size(),
+                                    "requestStructure", "system -> history -> user -> assistant(tool) -> tool"
+                            )
+                    )
+            );
+
+            ChatModel chatModel = requireChatModel();
+            ToolExecutionRequest toolExecutionRequest = agentToolConfirmationService.toToolExecutionRequest(confirmation);
+            if (approved) {
+                outputPort.emitProgress("CALLING_TOOL", "正在继续执行工具 " + toolExecutionRequest.name() + " ...", 0L);
+                tracePublisher.append(
+                        outputPort,
+                        outputPort.userMessageId(),
+                        "TOOL_EXECUTION_REQUESTED",
+                        "TOOL",
+                        toolRequestPayload(toolExecutionRequest, 1),
+                        true,
+                        null
+                );
+            }
+            ToolExecutionResultMessage firstToolResult = approved
+                    ? executeSingleToolRequest(toolRuntime, toolExecutionRequest, conversation, outputPort.requestId())
+                    : buildRejectedToolResultMessage(toolExecutionRequest);
+            if (approved) {
+                agentToolConfirmationService.markExecuted(confirmation.getId());
+            }
+
+            tracePublisher.append(
+                    outputPort,
+                    outputPort.userMessageId(),
+                    "TOOL_EXECUTION_COMPLETED",
+                    "TOOL",
+                    toolResultPayload(firstToolResult, 1),
+                    !Boolean.TRUE.equals(firstToolResult.isError()),
+                    null
+            );
+
+            ChatAnswerResult answerResult = continueAfterToolResult(
+                    chatModel,
+                    conversation,
+                    executionSpec,
+                    confirmation,
+                    toolRuntime,
+                    toolExecutionRequest,
+                    firstToolResult,
+                    historyMessages,
+                    outputPort
+            );
+
+            scheduleContinuationTitle(conversation, confirmation, historyMessages.isEmpty(), outputPort.answer());
+            tracePublisher.append(
+                    outputPort,
+                    answerResult.assistantMessageId(),
+                    "FINAL_RESPONSE_COMPLETED",
+                    "COMPLETED",
+                    tracePayload("answerLength", outputPort.answer().length()),
+                    true,
+                    null
+            );
+            outputPort.complete();
+        } catch (ToolConfirmationRequiredException exception) {
+            finishStreamWithPendingConfirmation(outputPort, exception.pendingConfirmation());
+        } catch (Exception exception) {
+            agentToolConfirmationService.markFailed(confirmation.getId(), safeMessage(exception));
+            Long assistantMessageId = conversationService.saveAssistantMessage(
+                    outputPort.conversationId(),
+                    outputPort.requestId(),
+                    outputPort.userMessageId(),
+                    outputPort.answer(),
+                    "error",
+                    safeMessage(exception)
+            );
+            tracePublisher.append(
+                    outputPort,
+                    assistantMessageId,
+                    "ERROR_OCCURRED",
+                    "FAILED",
+                    tracePayload("message", safeMessage(exception)),
+                    false,
+                    null
+            );
+            outputPort.fail(safeMessage(exception));
+        } finally {
+            executionGuard.release(conversation.getId(), outputPort.requestId());
+        }
+    }
+
     @PreDestroy
     void destroy() {
         executorService.shutdown();
+    }
+
+    private void traceResolvedToolContinuation(
+            ChatOutputPort outputPort,
+            AgentToolConfirmationDO confirmation,
+            boolean approved
+    ) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("confirmationId", confirmation.getId());
+        payload.put("originalRequestId", confirmation.getRequestId());
+        payload.put("continuationRequestId", outputPort.requestId());
+        payload.put("toolName", confirmation.getToolName());
+        payload.put("riskLevel", confirmation.getRiskLevel());
+        payload.put("modeCode", confirmation.getModeCode());
+        payload.put("decision", approved ? "APPROVED" : "REJECTED");
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                "TOOL_CONFIRMATION_CONTINUATION_STARTED",
+                "TOOL",
+                payload,
+                true,
+                null
+        );
+    }
+
+    private ChatAnswerResult continueAfterToolResult(
+            ChatModel chatModel,
+            ConversationDO conversation,
+            ChatExecutionSpec executionSpec,
+            AgentToolConfirmationDO confirmation,
+            ResolvedToolRuntime toolRuntime,
+            ToolExecutionRequest toolExecutionRequest,
+            ToolExecutionResultMessage firstToolResult,
+            List<ChatMessage> historyMessages,
+            ChatOutputPort outputPort
+    ) {
+        List<ChatMessage> messages = new ArrayList<>();
+        PromptAssembly promptAssembly = agentAiServiceFactory.buildPromptAssembly(toolRuntime);
+        messages.addAll(promptAssembly.toSystemMessages());
+        messages.addAll(historyMessages);
+
+        UserMessage currentUserMessage = UserMessage.from(confirmation.getUserMessageText());
+        AiMessage firstToolCallMessage = AiMessage.from(List.of(toolExecutionRequest));
+        messages.add(currentUserMessage);
+        messages.add(firstToolCallMessage);
+        messages.add(firstToolResult);
+
+        List<ChatMessage> memoryTurnMessages = new ArrayList<>();
+        memoryTurnMessages.add(firstToolCallMessage);
+        memoryTurnMessages.add(firstToolResult);
+
+        for (int round = 2; round <= MAX_AGENT_TOOL_ROUNDS; round++) {
+            tracePublisher.append(
+                    outputPort,
+                    outputPort.userMessageId(),
+                    "MODEL_REQUEST_STARTED",
+                    "MODEL",
+                    modelStartPayload("STREAM", 0, true, toolRuntime.toolCount(), round),
+                    true,
+                    null
+            );
+
+            ChatResponse response = withChatModelObservation(
+                    outputPort,
+                    "STREAM",
+                    () -> chatModel.chat(buildToolChatRequest(messages, toolRuntime))
+            );
+            AiMessage aiMessage = response.aiMessage();
+            if (aiMessage != null && aiMessage.hasToolExecutionRequests()) {
+                messages.add(aiMessage);
+                memoryTurnMessages.add(aiMessage);
+                List<ToolExecutionResultMessage> toolResults = executeContinuationToolRequests(
+                        toolRuntime,
+                        aiMessage.toolExecutionRequests(),
+                        conversation,
+                        executionSpec,
+                        confirmation,
+                        outputPort,
+                        round
+                );
+                messages.addAll(toolResults);
+                memoryTurnMessages.addAll(toolResults);
+                continue;
+            }
+
+            String answer = resolveAnswerText(aiMessage);
+            outputPort.replaceAnswer(answer);
+            emitAnswerTokens(outputPort, answer);
+            String finishReason = resolveFinishReason(response.finishReason());
+            Long assistantMessageId = conversationService.saveAssistantMessage(
+                    outputPort.conversationId(),
+                    outputPort.requestId(),
+                    outputPort.userMessageId(),
+                    answer,
+                    finishReason,
+                    null
+            );
+            outputPort.emitMessageEnd(answer, finishReason);
+            refreshConversationMemoryFromHistory(conversation.getId(), executionSpec.memoryEnabled());
+            return new ChatAnswerResult(assistantMessageId, List.of(), true);
+        }
+
+        throw new IllegalStateException("Agent 工具确认续跑轮次超过限制，请检查模型输出或工具配置。");
+    }
+
+    private List<ChatMessage> buildConversationHistoryMessages(Long conversationId) {
+        return conversationService.listRecentContextMessages(conversationId, null).stream()
+                .map(this::toHistoryChatMessage)
+                .toList();
+    }
+
+    private ChatMessage toHistoryChatMessage(ConversationMessageDO message) {
+        if (message == null) {
+            throw new IllegalArgumentException("history message 不能为空");
+        }
+        if ("USER".equalsIgnoreCase(message.getRoleCode())) {
+            return UserMessage.from(message.getContent() == null ? "" : message.getContent());
+        }
+        return AiMessage.from(message.getContent() == null ? "" : message.getContent());
+    }
+
+    private ToolExecutionResultMessage buildRejectedToolResultMessage(ToolExecutionRequest toolExecutionRequest) {
+        return ToolExecutionResultMessage.builder()
+                .id(toolExecutionRequest.id())
+                .toolName(toolExecutionRequest.name())
+                .text("""
+                        {
+                          "status": "USER_REJECTED",
+                          "message": "The user explicitly rejected this high-risk tool call. Do not execute it."
+                        }
+                        """.trim())
+                .isError(Boolean.TRUE)
+                .build();
+    }
+
+    private void scheduleContinuationTitle(
+            ConversationDO conversation,
+            AgentToolConfirmationDO confirmation,
+            boolean firstCompletedRound,
+            String assistantAnswer
+    ) {
+        if (!firstCompletedRound || !StringUtils.hasText(assistantAnswer)) {
+            return;
+        }
+        conversationTitleService.generateFirstRoundTitleAsync(
+                conversation.getId(),
+                confirmation.getUserMessageText(),
+                assistantAnswer
+        );
+    }
+
+    private void finishStreamWithPendingConfirmation(
+            ChatOutputPort outputPort,
+            ToolConfirmationPendingVO pendingConfirmation
+    ) {
+        outputPort.emitMessageEnd("", "tool_confirmation_required", pendingConfirmation);
+        outputPort.complete();
+    }
+
+    private List<ToolExecutionResultMessage> executeContinuationToolRequests(
+            ResolvedToolRuntime toolRuntime,
+            List<ToolExecutionRequest> toolExecutionRequests,
+            ConversationDO conversation,
+            ChatExecutionSpec executionSpec,
+            AgentToolConfirmationDO confirmation,
+            ChatOutputPort outputPort,
+            int modelRound
+    ) {
+        List<ToolExecutionResultMessage> resultMessages = new ArrayList<>();
+        ChatSendRequest request = buildConfirmationRequest(confirmation, executionSpec);
+
+        for (ToolExecutionRequest toolExecutionRequest : toolExecutionRequests) {
+            handleToolExecutionRequest(
+                    outputPort,
+                    conversation,
+                    executionSpec,
+                    request,
+                    toolRuntime,
+                    toolExecutionRequest
+            );
+
+            long startedAt = System.currentTimeMillis();
+            ToolExecutionResultMessage resultMessage = executeSingleToolRequest(
+                    toolRuntime,
+                    toolExecutionRequest,
+                    conversation,
+                    outputPort.requestId()
+            );
+            tracePublisher.append(
+                    outputPort,
+                    outputPort.userMessageId(),
+                    "TOOL_EXECUTION_COMPLETED",
+                    "TOOL",
+                    toolResultPayload(resultMessage, modelRound),
+                    !Boolean.TRUE.equals(resultMessage.isError()),
+                    (int) (System.currentTimeMillis() - startedAt)
+            );
+            resultMessages.add(resultMessage);
+        }
+
+        return resultMessages;
+    }
+
+    private ChatSendRequest buildConfirmationRequest(
+            AgentToolConfirmationDO confirmation,
+            ChatExecutionSpec executionSpec
+    ) {
+        return new ChatSendRequest(
+                confirmation.getConversationId(),
+                confirmation.getUserMessageText(),
+                executionSpec.ragEnabled(),
+                executionSpec.agentEnabled(),
+                executionSpec.memoryEnabled(),
+                executionSpec.knowledgeBaseIds(),
+                executionSpec.mcpServerIds()
+        );
+    }
+
+    private void refreshConversationMemoryFromHistory(Long conversationId, boolean memoryEnabled) {
+        if (!memoryEnabled) {
+            return;
+        }
+        conversationMemoryService.clearMemory(conversationId);
+        var chatMemory = conversationMemoryService.getOrCreateMemory(conversationId);
+        for (ChatMessage historyMessage : buildConversationHistoryMessages(conversationId)) {
+            chatMemory.add(historyMessage);
+        }
     }
 
     /**
@@ -464,8 +879,15 @@ public class ChatOrchestrator {
                     executionSpec.memoryEnabled(),
                     ragRuntime,
                     toolRuntime,
-                    beforeToolExecution -> traceBeforeToolExecution(outputPort, beforeToolExecution),
-                    toolExecution -> traceToolExecution(outputPort, toolExecution)
+                    beforeToolExecution -> traceBeforeToolExecution(
+                            outputPort,
+                            conversation,
+                            executionSpec,
+                            request,
+                            toolRuntime,
+                            beforeToolExecution
+                    ),
+                    toolExecution -> traceToolExecution(outputPort, toolRuntime, toolExecution)
             );
             Result<String> result = withChatModelObservation(
                     outputPort,
@@ -532,8 +954,15 @@ public class ChatOrchestrator {
                     executionSpec.memoryEnabled(),
                     ragRuntime,
                     toolRuntime,
-                    beforeToolExecution -> traceBeforeToolExecution(outputPort, beforeToolExecution),
-                    toolExecution -> traceToolExecution(outputPort, toolExecution)
+                    beforeToolExecution -> traceBeforeToolExecution(
+                            outputPort,
+                            conversation,
+                            executionSpec,
+                            request,
+                            toolRuntime,
+                            beforeToolExecution
+                    ),
+                    toolExecution -> traceToolExecution(outputPort, toolRuntime, toolExecution)
             );
 
             withChatModelObservation(outputPort, "STREAM", () -> assistant.answer(conversation.getId(), request.message())
@@ -588,6 +1017,10 @@ public class ChatOrchestrator {
                     })
                     .onError(error -> {
                         try {
+                            if (error instanceof ToolConfirmationRequiredException toolConfirmationRequiredException) {
+                                finishStreamWithPendingConfirmation(outputPort, toolConfirmationRequiredException.pendingConfirmation());
+                                return;
+                            }
                             Long assistantMessageId = conversationService.saveAssistantMessage(
                                     outputPort.conversationId(),
                                     outputPort.requestId(),
@@ -614,6 +1047,10 @@ public class ChatOrchestrator {
                     .start());
         } catch (Exception exception) {
             try {
+                if (exception instanceof ToolConfirmationRequiredException toolConfirmationRequiredException) {
+                    finishStreamWithPendingConfirmation(outputPort, toolConfirmationRequiredException.pendingConfirmation());
+                    return;
+                }
                 Long assistantMessageId = conversationService.saveAssistantMessage(
                         outputPort.conversationId(),
                         outputPort.requestId(),
@@ -1191,13 +1628,36 @@ public class ChatOrchestrator {
         return safeSnippets;
     }
 
-    private void traceBeforeToolExecution(ChatOutputPort outputPort, BeforeToolExecution beforeToolExecution) {
+    private void traceBeforeToolExecution(
+            ChatOutputPort outputPort,
+            ConversationDO conversation,
+            ChatExecutionSpec executionSpec,
+            ChatSendRequest request,
+            ResolvedToolRuntime toolRuntime,
+            BeforeToolExecution beforeToolExecution
+    ) {
         if (beforeToolExecution == null || beforeToolExecution.request() == null) {
             return;
         }
 
-        ToolExecutionRequest toolExecutionRequest = beforeToolExecution.request();
-        outputPort.emitProgress("CALLING_TOOL", "正在调用工具 " + toolExecutionRequest.name() + " ...", 0L);
+        handleToolExecutionRequest(
+                outputPort,
+                conversation,
+                executionSpec,
+                request,
+                toolRuntime,
+                beforeToolExecution.request()
+        );
+    }
+
+    private void handleToolExecutionRequest(
+            ChatOutputPort outputPort,
+            ConversationDO conversation,
+            ChatExecutionSpec executionSpec,
+            ChatSendRequest request,
+            ResolvedToolRuntime toolRuntime,
+            ToolExecutionRequest toolExecutionRequest
+    ) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolCallId", toolExecutionRequest.id());
         payload.put("toolName", toolExecutionRequest.name());
@@ -1211,18 +1671,86 @@ public class ChatOrchestrator {
                 true,
                 null
         );
+
+        ToolRuntimeToolMetadata metadata = toolRuntime == null ? null : toolRuntime.toolMetadata(toolExecutionRequest.name());
+        AgentToolRiskDecision decision = agentToolRiskGuard.evaluate(metadata);
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                "TOOL_RISK_EVALUATED",
+                "TOOL",
+                toolRiskPayload(toolExecutionRequest, metadata, decision),
+                decision.isAllowed(),
+                null
+        );
+
+        if (decision.action() == AgentToolRiskDecision.Action.ALLOW) {
+            outputPort.emitProgress("CALLING_TOOL", "正在调用工具 " + toolExecutionRequest.name() + " ...", 0L);
+            return;
+        }
+
+        if (decision.action() == AgentToolRiskDecision.Action.REQUIRE_CONFIRMATION) {
+            ToolConfirmationPendingVO pendingConfirmation = agentToolConfirmationService.createPendingConfirmation(
+                    outputPort.requestId(),
+                    conversation.getId(),
+                    outputPort.userMessageId(),
+                    executionSpec,
+                    request.message(),
+                    metadata,
+                    toolExecutionRequest
+            );
+            outputPort.emitProgress(
+                    "TOOL_CONFIRMATION_REQUIRED",
+                    "工具 " + toolExecutionRequest.name() + " 风险等级较高，当前已被平台拦截，等待后续确认能力接入。",
+                    0L
+            );
+            Map<String, Object> confirmationPayload = toolRiskPayload(toolExecutionRequest, metadata, decision);
+            confirmationPayload.put("confirmationId", pendingConfirmation.id());
+            tracePublisher.append(
+                    outputPort,
+                    outputPort.userMessageId(),
+                    "TOOL_CONFIRMATION_REQUIRED",
+                    "TOOL",
+                    confirmationPayload,
+                    false,
+                    null
+            );
+            throw new ToolConfirmationRequiredException(pendingConfirmation);
+        }
+
+        outputPort.emitProgress(
+                "TOOL_EXECUTION_BLOCKED",
+                "工具 " + toolExecutionRequest.name() + " 已被平台策略阻断。",
+                0L
+        );
+        tracePublisher.append(
+                outputPort,
+                outputPort.userMessageId(),
+                "TOOL_EXECUTION_BLOCKED",
+                "TOOL",
+                toolRiskPayload(toolExecutionRequest, metadata, decision),
+                false,
+                null
+        );
     }
 
-    private void traceToolExecution(ChatOutputPort outputPort, ToolExecution toolExecution) {
+    private void traceToolExecution(
+            ChatOutputPort outputPort,
+            ResolvedToolRuntime toolRuntime,
+            ToolExecution toolExecution
+    ) {
         if (toolExecution == null || toolExecution.request() == null) {
             return;
         }
 
+        ToolRuntimeToolMetadata metadata = toolRuntime == null ? null : toolRuntime.toolMetadata(toolExecution.request().name());
+        AgentToolRiskDecision decision = agentToolRiskGuard.evaluate(metadata);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolCallId", toolExecution.request().id());
         payload.put("toolName", toolExecution.request().name());
         payload.put("isError", toolExecution.hasFailed());
         payload.put("resultPreview", shorten(toolExecution.result(), 1000));
+        appendToolMetadata(payload, metadata, decision);
         tracePublisher.append(
                 outputPort,
                 outputPort.userMessageId(),
@@ -1232,6 +1760,37 @@ public class ChatOrchestrator {
                 !toolExecution.hasFailed(),
                 null
         );
+    }
+
+    private Map<String, Object> toolRiskPayload(
+            ToolExecutionRequest toolExecutionRequest,
+            ToolRuntimeToolMetadata metadata,
+            AgentToolRiskDecision decision
+    ) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("toolCallId", toolExecutionRequest.id());
+        payload.put("toolName", toolExecutionRequest.name());
+        payload.put("arguments", shorten(toolExecutionRequest.arguments(), 1000));
+        appendToolMetadata(payload, metadata, decision);
+        return payload;
+    }
+
+    private void appendToolMetadata(
+            Map<String, Object> payload,
+            ToolRuntimeToolMetadata metadata,
+            AgentToolRiskDecision decision
+    ) {
+        payload.put("riskLevel", decision.riskLevel().name());
+        payload.put("decision", decision.action().name());
+        payload.put("reason", decision.reason());
+        if (metadata == null) {
+            return;
+        }
+        payload.put("serverId", metadata.serverId());
+        payload.put("serverName", metadata.serverName());
+        payload.put("toolSnapshotId", metadata.toolSnapshotId());
+        payload.put("originToolName", metadata.originToolName());
+        payload.put("toolTitle", metadata.toolTitle());
     }
 
     private String resolveFinishReason(FinishReason finishReason) {

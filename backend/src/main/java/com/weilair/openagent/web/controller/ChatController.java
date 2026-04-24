@@ -48,6 +48,16 @@ public class ChatController {
         return ApiResponse.success(chatGenerationService.submit(request));
     }
 
+    @PostMapping("/tool-confirmations/{confirmationId}/approve")
+    public ApiResponse<ChatRequestAcceptedVO> approveToolConfirmation(@PathVariable Long confirmationId) {
+        return ApiResponse.success(chatGenerationService.approveToolConfirmation(confirmationId));
+    }
+
+    @PostMapping("/tool-confirmations/{confirmationId}/reject")
+    public ApiResponse<ChatRequestAcceptedVO> rejectToolConfirmation(@PathVariable Long confirmationId) {
+        return ApiResponse.success(chatGenerationService.rejectToolConfirmation(confirmationId));
+    }
+
     @GetMapping("/stream/{requestId}")
     public SseEmitter stream(@PathVariable String requestId) {
         return chatStreamSessionStore.connect(requestId);

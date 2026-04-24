@@ -1,5 +1,7 @@
 package com.weilair.openagent.chat.service;
 
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
+
 /**
  * 同步模式下的输出口只需要做一件事：在一次请求生命周期内稳定缓冲最终答案。
  * 它不负责实时事件发送，但会保留和流式输出口一致的状态接口，
@@ -114,7 +116,7 @@ public class BufferedChatOutputPort implements ChatOutputPort {
     }
 
     @Override
-    public void emitMessageEnd(String answer, String finishReason) {
+    public void emitMessageEnd(String answer, String finishReason, ToolConfirmationPendingVO pendingConfirmation) {
         this.finishReason = finishReason == null || finishReason.isBlank() ? "stop" : finishReason;
     }
 

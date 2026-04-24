@@ -282,17 +282,35 @@ public class ChatSendRequest {
 public class ChatAnswerVO {
     private String requestId;
     private Long conversationId;
-    private Long userMessageId;
-    private Long assistantMessageId;
     private String answer;
     private String finishReason;
     private Boolean usedRag;
     private Boolean usedTools;
-    private List<RagSnippetVO> ragSnippets;
-    private List<ToolCallVO> toolCalls;
     private Long elapsedMillis;
+    private ToolConfirmationPendingVO pendingConfirmation;
+}
+
+public class ToolConfirmationPendingVO {
+    private Long id;
+    private String requestId;
+    private Long conversationId;
+    private String toolCallId;
+    private String toolName;
+    private String toolTitle;
+    private String serverName;
+    private String riskLevel;
+    private String status;
+    private String statusMessage;
 }
 ```
+
+### 说明
+
+- 当命中高风险工具且当前请求需要人工确认时：
+  - `finishReason = tool_confirmation_required`
+  - `answer` 为空字符串
+  - `pendingConfirmation` 返回待确认记录
+- 同步接口不会因为待确认而退化成 500。
 
 ------
 
@@ -381,7 +399,7 @@ event: token
 data: {"content":"根据当前配置..."}
 
 event: message_end
-data: {"assistantMessageId":9002,"finishReason":"stop"}
+data: {"requestId":"req_xxx","answer":"最终回答","finishReason":"stop","pendingConfirmation":null}
 ```
 
 ### 后端建议
@@ -398,6 +416,43 @@ data: {"assistantMessageId":9002,"finishReason":"stop"}
 - 不写入 `conversation_message`
 - 不写入 `trace_event`
 - 不参与后续模型上下文
+
+### 待确认场景的 `message_end`
+
+当流式链路命中高风险工具时，当前 SSE 必须正常结束：
+
+```
+event: message_end
+data: {
+  "requestId": "req_xxx",
+  "answer": "",
+  "finishReason": "tool_confirmation_required",
+  "pendingConfirmation": {
+    "id": 3001,
+    "toolCallId": "call_1",
+    "toolName": "weather-mcp__delete_file",
+    "riskLevel": "HIGH",
+    "status": "PENDING"
+  }
+}
+```
+
+- 前端据此把当前 assistant 气泡切到“待确认”状态。
+- SSE 必须结束，不能让前端一直卡在流式连接里。
+
+### 4.7.3 工具确认接口
+
+#### `POST /api/v1/chat/tool-confirmations/{confirmationId}/approve`
+
+- 作用：确认执行已记录的高风险工具请求。
+- 返回：`ApiResponse<ChatRequestAcceptedVO>`
+- 说明：后端不会重新让模型生成 tool call，而是继续执行已记录的 `tool request`，并开启新的 continuation `requestId` 供聊天 SSE / Trace SSE 订阅。
+
+#### `POST /api/v1/chat/tool-confirmations/{confirmationId}/reject`
+
+- 作用：拒绝执行已记录的高风险工具请求。
+- 返回：`ApiResponse<ChatRequestAcceptedVO>`
+- 说明：后端会构造结构化 `USER_REJECTED` tool result 回送模型，继续完成这一轮自然语言回答。
 
 ------
 
@@ -1280,6 +1335,8 @@ void archiveConversation(Long conversationId);
 ```
 ChatAnswerVO sendSync(ChatSendRequest request);
 ChatRequestAcceptedVO submit(ChatSendRequest request);
+ChatRequestAcceptedVO approveToolConfirmation(Long confirmationId);
+ChatRequestAcceptedVO rejectToolConfirmation(Long confirmationId);
 void stream(String requestId, SseEmitter emitter);
 ChatAnswerVO regenerate(ChatRegenerateRequest request);
 PageResponse<ConversationMessageVO> pageMessages(Long conversationId, MessageQuery query);

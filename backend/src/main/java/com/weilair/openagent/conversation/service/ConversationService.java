@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Objects;
 
 import com.weilair.openagent.ai.config.OpenAgentMemoryProperties;
+import com.weilair.openagent.chat.persistence.mapper.AgentToolConfirmationMapper;
 import com.weilair.openagent.chat.model.ChatMode;
 import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.conversation.exception.ConversationNotFoundException;
@@ -53,6 +54,7 @@ public class ConversationService {
     private final ChatMemorySessionMapper chatMemorySessionMapper;
     private final ChatMemoryMessageMapper chatMemoryMessageMapper;
     private final TraceEventMapper traceEventMapper;
+    private final AgentToolConfirmationMapper agentToolConfirmationMapper;
 
     public ConversationService(
             OpenAgentMemoryProperties memoryProperties,
@@ -65,7 +67,8 @@ public class ConversationService {
             ConversationMemoryService conversationMemoryService,
             ChatMemorySessionMapper chatMemorySessionMapper,
             ChatMemoryMessageMapper chatMemoryMessageMapper,
-            TraceEventMapper traceEventMapper
+            TraceEventMapper traceEventMapper,
+            AgentToolConfirmationMapper agentToolConfirmationMapper
     ) {
         this.memoryProperties = memoryProperties;
         this.conversationMapper = conversationMapper;
@@ -78,6 +81,7 @@ public class ConversationService {
         this.chatMemorySessionMapper = chatMemorySessionMapper;
         this.chatMemoryMessageMapper = chatMemoryMessageMapper;
         this.traceEventMapper = traceEventMapper;
+        this.agentToolConfirmationMapper = agentToolConfirmationMapper;
     }
 
     /**
@@ -206,6 +210,7 @@ public class ConversationService {
         }
 
         traceEventMapper.deleteByConversationId(conversationId);
+        agentToolConfirmationMapper.deleteByConversationId(conversationId);
         conversationMessageMapper.deleteByConversationId(conversationId);
         conversationKbBindingMapper.deleteByConversationId(conversationId);
         conversationMcpBindingMapper.deleteByConversationId(conversationId);

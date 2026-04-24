@@ -28,4 +28,12 @@ public class ChatGenerationService {
     public ChatRequestAcceptedVO submit(ChatSendRequest request) {
         return chatOrchestrator.submit(request);
     }
+
+    public ChatRequestAcceptedVO approveToolConfirmation(Long confirmationId) {
+        return chatOrchestrator.approveToolConfirmation(confirmationId);
+    }
+
+    public ChatRequestAcceptedVO rejectToolConfirmation(Long confirmationId) {
+        return chatOrchestrator.rejectToolConfirmation(confirmationId);
+    }
 }

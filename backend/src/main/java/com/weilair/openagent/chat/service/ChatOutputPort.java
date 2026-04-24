@@ -1,6 +1,7 @@
 package com.weilair.openagent.chat.service;
 
 import com.weilair.openagent.web.vo.TraceEventVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 
 /**
  * `ChatOutputPort` 是统一编排骨架第二轮收口里的“输出边界”。
@@ -45,7 +46,11 @@ public interface ChatOutputPort {
 
     void emitToken(String token);
 
-    void emitMessageEnd(String answer, String finishReason);
+    default void emitMessageEnd(String answer, String finishReason) {
+        emitMessageEnd(answer, finishReason, null);
+    }
+
+    void emitMessageEnd(String answer, String finishReason, ToolConfirmationPendingVO pendingConfirmation);
 
     void complete();
 

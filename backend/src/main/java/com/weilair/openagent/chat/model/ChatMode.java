@@ -48,4 +48,16 @@ public enum ChatMode {
         }
         return CHAT;
     }
+
+    public static ChatMode fromCode(String code) {
+        if (code == null || code.isBlank()) {
+            return CHAT;
+        }
+        for (ChatMode value : values()) {
+            if (value.code.equalsIgnoreCase(code.trim())) {
+                return value;
+            }
+        }
+        return CHAT;
+    }
 }

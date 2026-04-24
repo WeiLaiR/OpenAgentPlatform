@@ -7,6 +7,7 @@ public record ChatAnswerVO(
         String finishReason,
         Boolean usedRag,
         Boolean usedTools,
-        Long elapsedMillis
+        Long elapsedMillis,
+        ToolConfirmationPendingVO pendingConfirmation
 ) {
 }
