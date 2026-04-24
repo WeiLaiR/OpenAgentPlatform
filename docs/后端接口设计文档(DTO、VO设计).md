@@ -294,6 +294,7 @@ public class ToolConfirmationPendingVO {
     private Long id;
     private String requestId;
     private Long conversationId;
+    private Long userMessageId;
     private String toolCallId;
     private String toolName;
     private String toolTitle;
@@ -301,6 +302,8 @@ public class ToolConfirmationPendingVO {
     private String riskLevel;
     private String status;
     private String statusMessage;
+    private Long expiresAt;
+    private Long createdAt;
 }
 ```
 
@@ -429,10 +432,15 @@ data: {
   "finishReason": "tool_confirmation_required",
   "pendingConfirmation": {
     "id": 3001,
+    "requestId": "req_xxx",
+    "conversationId": 1001,
+    "userMessageId": 2001,
     "toolCallId": "call_1",
     "toolName": "weather-mcp__delete_file",
     "riskLevel": "HIGH",
-    "status": "PENDING"
+    "status": "PENDING",
+    "expiresAt": 1777017600000,
+    "createdAt": 1777017000000
   }
 }
 ```
@@ -453,6 +461,15 @@ data: {
 - 作用：拒绝执行已记录的高风险工具请求。
 - 返回：`ApiResponse<ChatRequestAcceptedVO>`
 - 说明：后端会构造结构化 `USER_REJECTED` tool result 回送模型，继续完成这一轮自然语言回答。
+
+#### `GET /api/v1/chat/tool-confirmations/pending?conversationId={conversationId}`
+
+- 作用：按会话查询当前仍可操作的待确认工具调用，用于页面刷新或重新进入会话后的状态恢复。
+- 返回：`ApiResponse<List<ToolConfirmationPendingVO>>`
+- 说明：
+  - 只返回仍处于 `PENDING` 且未过期的记录。
+  - 查询时会把已经超过 `expiresAt` 的 `PENDING` 记录推进为 `EXPIRED`，并从本次可操作结果中剔除。
+  - 前端可根据 `userMessageId` 把待确认 assistant 状态恢复到对应用户消息之后。
 
 ------
 

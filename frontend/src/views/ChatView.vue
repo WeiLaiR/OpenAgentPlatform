@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChatDotRound, CopyDocument, Delete, MoreFilled, Plus, Setting } from '@element-plus/icons-vue'
+import { Delete, MoreFilled, Plus, Setting } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
@@ -15,6 +15,7 @@ import {
 } from '@/api/conversation'
 import {
   approveToolConfirmation,
+  listPendingToolConfirmations,
   rejectToolConfirmation,
   submitChat,
   sendChatSync,
@@ -415,13 +416,14 @@ async function selectConversation(conversationId: number) {
   resetAssistantMarkdownRenderState()
   resetRequestOverrides()
 
-  const [records, conversation] = await Promise.all([
+  const [records, conversation, pendingConfirmations] = await Promise.all([
     listConversationMessages(conversationId),
     getConversationSettings(conversationId),
+    listPendingToolConfirmations(conversationId),
   ])
   applyConversationSettings(conversation)
   updateConversationCache(conversation)
-  messages.value = normalizeMessages(records)
+  messages.value = normalizeMessages(records, pendingConfirmations)
   await focusChatInput()
   keepChatHistoryPinned(true)
 }
@@ -1112,14 +1114,47 @@ function formatThinkingElapsed(startedAt: number | undefined) {
   return `${elapsedSeconds}s`
 }
 
-function normalizeMessages(records: ConversationMessage[]) {
-  return records.map((item) => ({
+function normalizeMessages(
+  records: ConversationMessage[],
+  pendingConfirmations: ToolConfirmationPending[] = [],
+) {
+  const normalized: ConversationMessage[] = records.map((item) => ({
     ...item,
     uiState: item.roleCode === 'ASSISTANT' ? ('done' as const) : undefined,
     renderedContentHtml:
       item.roleCode === 'ASSISTANT' && item.content ? renderMarkdownToHtml(item.content) : undefined,
     renderCacheKey: item.roleCode === 'ASSISTANT' ? item.content : undefined,
   }))
+
+  for (const pendingConfirmation of pendingConfirmations) {
+    if (normalized.some((item) => item.requestId === pendingConfirmation.requestId && item.roleCode === 'ASSISTANT')) {
+      continue
+    }
+
+    const pendingMessage: ConversationMessage = {
+      id: -pendingConfirmation.id,
+      conversationId: pendingConfirmation.conversationId,
+      roleCode: 'ASSISTANT',
+      messageType: 'TEXT',
+      content: '',
+      requestId: pendingConfirmation.requestId,
+      finishReason: 'tool_confirmation_required',
+      createdAt: pendingConfirmation.createdAt ?? Date.now(),
+      uiState: 'pending_confirmation',
+      pendingConfirmation,
+      renderedContentHtml: '',
+      renderCacheKey: '',
+    }
+
+    const userMessageIndex = normalized.findIndex((item) => item.id === pendingConfirmation.userMessageId)
+    if (userMessageIndex >= 0) {
+      normalized.splice(userMessageIndex + 1, 0, pendingMessage)
+    } else {
+      normalized.push(pendingMessage)
+    }
+  }
+
+  return normalized
 }
 
 function formatTracePayload(payload: string) {

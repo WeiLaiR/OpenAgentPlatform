@@ -21,6 +21,7 @@ export interface ToolConfirmationPending {
   id: number
   requestId: string
   conversationId: number
+  userMessageId: number | null
   toolCallId: string
   toolName: string
   toolTitle: string | null
@@ -28,6 +29,8 @@ export interface ToolConfirmationPending {
   riskLevel: string
   status: string
   statusMessage: string
+  expiresAt: number | null
+  createdAt: number | null
 }
 
 export interface ChatAnswer {
@@ -102,6 +105,15 @@ export async function rejectToolConfirmation(confirmationId: number): Promise<Ch
     {
       method: 'POST',
     },
+  )
+  return response.data
+}
+
+export async function listPendingToolConfirmations(
+  conversationId: number,
+): Promise<ToolConfirmationPending[]> {
+  const response = await request<ToolConfirmationPending[]>(
+    `/api/v1/chat/tool-confirmations/pending?conversationId=${conversationId}`,
   )
   return response.data
 }

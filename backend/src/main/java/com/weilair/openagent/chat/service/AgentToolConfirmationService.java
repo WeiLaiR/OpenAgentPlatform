@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.weilair.openagent.chat.model.AgentToolConfirmationDO;
 import com.weilair.openagent.chat.model.ChatMode;
 import com.weilair.openagent.chat.persistence.mapper.AgentToolConfirmationMapper;
+import com.weilair.openagent.common.util.TimeUtils;
 import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import org.springframework.stereotype.Service;
@@ -76,6 +77,25 @@ public class AgentToolConfirmationService {
             throw new IllegalArgumentException("待确认工具调用不存在: " + confirmationId);
         }
         return confirmation;
+    }
+
+    /**
+     * 页面刷新后不再依赖前端内存恢复高风险工具确认状态。
+     * 这里以会话为粒度读取仍处于 PENDING 的记录，同时把已经超过 TTL 的记录推进到 EXPIRED，
+     * 让“可继续操作的待确认项”和“历史治理状态”保持一致。
+     */
+    @Transactional
+    public List<ToolConfirmationPendingVO> listPendingByConversationId(Long conversationId) {
+        return agentToolConfirmationMapper.selectPendingByConversationId(conversationId).stream()
+                .filter(confirmation -> {
+                    if (!isExpired(confirmation)) {
+                        return true;
+                    }
+                    agentToolConfirmationMapper.markExpired(confirmation.getId());
+                    return false;
+                })
+                .map(this::toPendingVO)
+                .toList();
     }
 
     @Transactional
@@ -150,13 +170,16 @@ public class AgentToolConfirmationService {
                 confirmation.getId(),
                 confirmation.getRequestId(),
                 confirmation.getConversationId(),
+                confirmation.getUserMessageId(),
                 confirmation.getToolCallId(),
                 confirmation.getToolName(),
                 confirmation.getToolTitle(),
                 confirmation.getServerName(),
                 confirmation.getRiskLevel(),
                 confirmation.getStatusCode(),
-                buildStatusMessage(confirmation)
+                buildStatusMessage(confirmation),
+                TimeUtils.toEpochMillis(confirmation.getExpiresAt()),
+                TimeUtils.toEpochMillis(confirmation.getCreatedAt())
         );
     }
 

@@ -1,17 +1,21 @@
 package com.weilair.openagent.web.controller;
 
+import java.util.List;
+
 import com.weilair.openagent.chat.service.ChatGenerationService;
 import com.weilair.openagent.chat.service.ChatStreamSessionStore;
 import com.weilair.openagent.common.response.ApiResponse;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
 import com.weilair.openagent.web.vo.ChatRequestAcceptedVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -56,6 +60,13 @@ public class ChatController {
     @PostMapping("/tool-confirmations/{confirmationId}/reject")
     public ApiResponse<ChatRequestAcceptedVO> rejectToolConfirmation(@PathVariable Long confirmationId) {
         return ApiResponse.success(chatGenerationService.rejectToolConfirmation(confirmationId));
+    }
+
+    @GetMapping("/tool-confirmations/pending")
+    public ApiResponse<List<ToolConfirmationPendingVO>> listPendingToolConfirmations(
+            @RequestParam Long conversationId
+    ) {
+        return ApiResponse.success(chatGenerationService.listPendingToolConfirmations(conversationId));
     }
 
     @GetMapping("/stream/{requestId}")

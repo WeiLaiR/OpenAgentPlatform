@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.util.StringUtils;
 
 @Configuration
@@ -18,6 +19,7 @@ public class OpenAgentMilvusConfig {
      */
 
     @Bean
+    @Lazy
     @ConditionalOnExpression("'${milvus.host:}' != ''")
     public MilvusClientV2 milvusClient(OpenAgentMilvusProperties properties) {
         ConnectConfig.ConnectConfigBuilder builder = ConnectConfig.builder()

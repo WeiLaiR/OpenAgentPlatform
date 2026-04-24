@@ -3,6 +3,8 @@ package com.weilair.openagent.chat.service;
 import com.weilair.openagent.web.dto.ChatSendRequest;
 import com.weilair.openagent.web.vo.ChatAnswerVO;
 import com.weilair.openagent.web.vo.ChatRequestAcceptedVO;
+import com.weilair.openagent.web.vo.ToolConfirmationPendingVO;
+import java.util.List;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -16,9 +18,14 @@ public class ChatGenerationService {
      * 这里后续只保留“兼容旧入口”的薄适配职责。
      */
     private final ChatOrchestrator chatOrchestrator;
+    private final AgentToolConfirmationService agentToolConfirmationService;
 
-    public ChatGenerationService(ChatOrchestrator chatOrchestrator) {
+    public ChatGenerationService(
+            ChatOrchestrator chatOrchestrator,
+            AgentToolConfirmationService agentToolConfirmationService
+    ) {
         this.chatOrchestrator = chatOrchestrator;
+        this.agentToolConfirmationService = agentToolConfirmationService;
     }
 
     public ChatAnswerVO sendSync(ChatSendRequest request) {
@@ -35,5 +42,9 @@ public class ChatGenerationService {
 
     public ChatRequestAcceptedVO rejectToolConfirmation(Long confirmationId) {
         return chatOrchestrator.rejectToolConfirmation(confirmationId);
+    }
+
+    public List<ToolConfirmationPendingVO> listPendingToolConfirmations(Long conversationId) {
+        return agentToolConfirmationService.listPendingByConversationId(conversationId);
     }
 }
